@@ -1,17 +1,16 @@
 {
     "name": "file-browser",
-    "publisher": "bodil",
+    "publisher": "NamesAreOverrated",
     "displayName": "File Browser",
     "description": "A nicer alternative to the file open dialog.",
-    "version": "0.2.11",
+    "version": "0.0.1",
     "license": "LGPL-3.0+",
     "author": {
-        "name": "Bodil Stokke",
-        "url": "https://bodil.lol/"
+        "name": "NamesAreOverrated"
     },
     "repository": {
         "type": "git",
-        "url": "https://github.com/bodil/vscode-file-browser"
+        "url": "https://github.com/NamesAreOverrated/vscode-file-browser"
     },
     "keywords": [
         "emacs",
@@ -19,7 +18,7 @@
     ],
     "icon": "images/icon.png",
     "engines": {
-        "vscode": "^1.75"
+        "vscode": "^1.22.0"
     },
     "categories": [
         "Other"
@@ -129,7 +128,7 @@
         "@types/eslint__js": "^8.42.3",
         "@types/glob": "^8.1.0",
         "@types/mocha": "^10.0.8",
-        "@types/node": "^22.7.4",
+        "@types/node": "^22.19.17",
         "@types/vscode": "1.75.1",
         "@typescript-eslint/eslint-plugin": "^8.8.0",
         "@typescript-eslint/parser": "^8.8.0",

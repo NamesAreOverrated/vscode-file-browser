@@ -10,6 +10,7 @@ export class FileItem implements QuickPickItem {
     description?: string;
     fileType?: FileType;
     action?: Action;
+    payload?: any; // 新增：用于挂载特殊搜索的 Uri 或批量操作参数
 
     constructor(record: [string, FileType]) {
         const [name, fileType] = record;
