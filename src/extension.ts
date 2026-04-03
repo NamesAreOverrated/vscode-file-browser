@@ -65,77 +65,84 @@ function applyWildcard(name: string, from: string, to: string): string | null {
     return result;
 }
 
-/**
- * 强大的路径通配符展开引擎 (支持 *, ** 和分段路径展开)
- * @param baseUri 起始路径
- * @param mustExist 如果为 true，只返回存在的文件/文件夹 (适用于修改操作); 若 false，则返回计算出的路径(适用于创建)
- */
 async function expandPathWildcards(baseUri: Uri, pattern: string, mustExist: boolean): Promise<{ name: string, uri: Uri }[]> {
-    const segments = pattern.split('/');
-    let currentPaths = [{ name: "", uri: baseUri }];
+    // 统一处理分隔符，并将路径拆分为段
+    const segments = pattern.split('/').filter(s => s.length > 0);
+    let currentPaths: { name: string, uri: Uri }[] = [{ name: "", uri: baseUri }];
 
     for (let i = 0; i < segments.length; i++) {
         const seg = segments[i];
-        const nextPaths: { name: string, uri: Uri }[] = [];
+        const nextPathsMap = new Map<string, { name: string, uri: Uri }>();
 
         for (const cur of currentPaths) {
             if (seg === '**') {
-                // 递归所有子文件夹 (最大深度5，防止超大项目卡死)
-                async function getSubDirs(u: Uri, rel: string, depth: number = 0) {
+                // --- 修复：改进递归逻辑，使用 Map 去重 ---
+                async function collectDirs(u: Uri, rel: string, depth: number) {
                     if (depth > 5) return;
-                    nextPaths.push({ name: rel, uri: u });
+                    // ** 也可以匹配当前层级（即空路径段）
+                    const key = u.toString();
+                    if (!nextPathsMap.has(key)) {
+                        nextPathsMap.set(key, { name: rel, uri: u });
+                    }
+
                     try {
                         const entries = await vscode.workspace.fs.readDirectory(u);
                         for (const [n, t] of entries) {
-                            if (t & FileType.Directory || t & FileType.SymbolicLink) {
-                                await getSubDirs(Uri.joinPath(u, n), rel ? `${rel}/${n}` : n, depth + 1);
+                            if (t & FileType.Directory) {
+                                await collectDirs(Uri.joinPath(u, n), rel ? `${rel}/${n}` : n, depth + 1);
                             }
                         }
-                    } catch (e) { }
+                    } catch { /* 忽略无法读取的目录 */ }
                 }
-                await getSubDirs(cur.uri, cur.name);
+                await collectDirs(cur.uri, cur.name, 0);
             }
             else if (seg.includes('*')) {
+                // --- 修复：* 必须基于物理存在的目录进行展开 ---
                 try {
                     const entries = await vscode.workspace.fs.readDirectory(cur.uri);
-                    const regexStr = '^' + seg.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\\\*/g, '.*') + '$';
-                    const regex = new RegExp(regexStr);
+                    // 将 glob 转换为 Regex: * -> .*, ? -> .
+                    const regexStr = '^' + seg.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$';
+                    const regex = new RegExp(regexStr, 'i');
 
                     for (const [name, type] of entries) {
-                        // 如果不是最后一段，只收集文件夹
-                        if (i < segments.length - 1 && !(type & FileType.Directory)) continue;
                         if (regex.test(name)) {
-                            nextPaths.push({
+                            // 如果不是最后一段，必须是目录才能继续
+                            const isDir = !!(type & FileType.Directory);
+                            if (i < segments.length - 1 && !isDir) continue;
+
+                            const nextUri = Uri.joinPath(cur.uri, name);
+                            nextPathsMap.set(nextUri.toString(), {
                                 name: cur.name ? `${cur.name}/${name}` : name,
-                                uri: Uri.joinPath(cur.uri, name)
+                                uri: nextUri
                             });
                         }
                     }
-                } catch (e) { }
-            } else {
-                // 普通路径段 (可能是 .. / . / 普通字符)
-                const nextUri = Uri.joinPath(cur.uri, seg);
-                let nextName = cur.name ? `${cur.name}/${seg}` : seg;
-                // 规范化名称展示
-                if (seg === '..') {
-                    const parts = cur.name.split('/');
-                    parts.pop();
-                    nextName = parts.join('/');
+                } catch (e) {
+                    // 如果 mustExist 为 false 且不含通配符，通常走下面的 else
+                    // 但如果含 * 且目录不存在，则无法展开，这里保持为空是正确的
                 }
+            }
+            else {
+                // 普通路径段 (a, b, .., .)
+                const nextUri = Uri.joinPath(cur.uri, seg);
+                const nextName = cur.name ? `${cur.name}/${seg}` : seg;
 
                 if (mustExist) {
                     try {
                         await vscode.workspace.fs.stat(nextUri);
-                        nextPaths.push({ name: nextName, uri: nextUri });
-                    } catch (e) { }
+                        nextPathsMap.set(nextUri.toString(), { name: nextName, uri: nextUri });
+                    } catch { }
                 } else {
-                    nextPaths.push({ name: nextName, uri: nextUri });
+                    nextPathsMap.set(nextUri.toString(), { name: nextName, uri: nextUri });
                 }
             }
         }
-        currentPaths = nextPaths;
+        currentPaths = Array.from(nextPathsMap.values());
+
+        // 性能优化：如果中间某段匹配不到任何东西，直接中断
+        if (currentPaths.length === 0) break;
     }
-    // 过滤掉空的根目录
+
     return currentPaths.filter(p => p.name !== "");
 }
 
@@ -651,22 +658,20 @@ class FileBrowser {
             case Action.OpenGlobalFolder: { /* 保持原代码 */ break; }
 
             case Action.BulkCreate: {
-                const paths = expandBraces(item.payload);
-                for (const p of paths) {
+                const patterns = expandBraces(item.payload);
+                for (const p of patterns) {
                     const resolved = await expandPathWildcards(this.path.uri, p, false);
                     for (const r of resolved) {
-                        const fullUri = r.uri;
-                        if (r.name.endsWith('/')) {
-                            await vscode.workspace.fs.createDirectory(fullUri);
+                        if (p.endsWith('/')) {
+                            await vscode.workspace.fs.createDirectory(r.uri);
                         } else {
-                            await vscode.workspace.fs.createDirectory(Uri.joinPath(fullUri, '..'));
-                            await vscode.workspace.fs.writeFile(fullUri, new Uint8Array(0));
+                            // 关键：创建文件前先创建它的父目录
+                            const parentUri = Uri.joinPath(r.uri, '..');
+                            await vscode.workspace.fs.createDirectory(parentUri);
+                            await vscode.workspace.fs.writeFile(r.uri, new Uint8Array(0));
                         }
                     }
                 }
-                this.current.value = "";
-                await this.update();
-                break;
             }
             case Action.BulkRename: {
                 const { from, to } = item.payload;
