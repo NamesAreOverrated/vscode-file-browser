@@ -299,7 +299,6 @@ class FileBrowser {
         if (value.startsWith("@")) return this.handleSymbolSearch(value.substring(1));
         if (value.startsWith(":")) return this.handleLineSearch(value.substring(1));
 
-        // 重量级命令防抖处理 (250ms)
         if (value.startsWith("!")) {
             this.searchTimeout = setTimeout(() => this.handleGlobalFileSearch(value.substring(1)), 250);
             return;
@@ -315,8 +314,9 @@ class FileBrowser {
             return;
         }
 
-        if (value.includes("{") || value.includes("*")) {
-            this.searchTimeout = setTimeout(() => this.handleBulkCreateSearch(value), 250);
+        // 修改：只要包含通配符或大括号，统一进入 Glob 搜索与创建混合逻辑
+        if (value.includes("{") || value.includes("*") || value.includes("?")) {
+            this.searchTimeout = setTimeout(() => this.handleGlobAndCreateSearch(value), 250);
             return;
         }
 
@@ -325,7 +325,7 @@ class FileBrowser {
             return;
         }
 
-        // 普通字符过滤
+        // ... 保留后续普通字符过滤逻辑 ...
         const query = value.toLowerCase();
         let displayItems = this.items.filter((item) => {
             if (item.action !== undefined && item.action !== Action.OpenFile) return true;
@@ -339,7 +339,7 @@ class FileBrowser {
                 name: value,
                 description: "Open as new file",
                 alwaysShow: true,
-                action: Action.OpenFile, // Action.OpenFile 现在兼顾创建
+                action: Action.OpenFile,
             } as FileItem;
             displayItems = [newItem, ...displayItems];
         }
@@ -396,64 +396,238 @@ class FileBrowser {
     }
 
     // --- 全局文件/文件夹搜索 --- (略, 保持之前版本不变)
-    async handleGlobalFileSearch(query: string) { /* ...原代码... */ }
-    async handleGlobalFolderSearch(query: string) { /* ...原代码... */ }
-    handleLineSearch(query: string) { /* ...原代码... */ }
-    async handleSymbolSearch(query: string) { /* ...原代码... */ }
 
-    async handleBulkCreateSearch(value: string) {
+    // --- 高级搜索处理器 ---
+    async handleSymbolSearch(query: string) {
+        if (!this.editorUri) {
+            this.current.items = [{ label: "No active file to search symbols...", name: "", alwaysShow: true } as FileItem];
+            return;
+        }
+
         const token = ++this.searchToken;
         this.current.busy = true;
 
         try {
-            const finalPaths: string[] = [];
+            const symbols = await vscode.commands.executeCommand<DocumentSymbol[]>('vscode.executeDocumentSymbolProvider', this.editorUri);
+            if (this.searchToken !== token) return;
+
+            if (!symbols) {
+                this.current.items = [{ label: "No symbols found.", name: "", alwaysShow: true } as FileItem];
+                return;
+            }
+
+            const flatSymbols: DocumentSymbol[] = [];
+            const extract = (syms: DocumentSymbol[]) => {
+                for (const s of syms) {
+                    flatSymbols.push(s);
+                    if (s.children) extract(s.children);
+                }
+            };
+            extract(symbols);
+
+            const q = query.trim().toLowerCase();
+            const filtered = flatSymbols.filter(s => s.name.toLowerCase().includes(q));
+
+            this.current.items = filtered.map(s => ({
+                label: `$(symbol-method) ${s.name}`,
+                name: s.name,
+                description: `Line ${s.range.start.line + 1}`,
+                alwaysShow: true,
+                action: Action.GoToSymbol,
+                payload: { uri: this.editorUri, range: s.range }
+            } as FileItem));
+        } catch (e) {
+            console.error(e);
+        } finally {
+            if (this.searchToken === token) this.current.busy = false;
+        }
+    }
+
+    handleLineSearch(query: string) {
+        query = query.trim();
+        const line = parseInt(query, 10);
+        if (isNaN(line)) {
+            this.current.items = [{ label: "Type a line number...", name: "", alwaysShow: true } as FileItem];
+            return;
+        }
+        this.current.items = [{
+            label: `$(go-to-file) Go to line ${line}`,
+            name: query,
+            alwaysShow: true,
+            action: Action.GoToLine,
+            payload: line
+        } as FileItem];
+    }
+
+    async handleGlobalFileSearch(query: string) {
+        query = query.trim();
+        if (query.length < 2) {
+            this.current.items = [{ label: "Type at least 2 chars to search...", name: "", alwaysShow: true } as FileItem];
+            return;
+        }
+
+        const token = ++this.searchToken;
+        this.current.busy = true;
+
+        try {
+            const files = await vscode.workspace.findFiles(`**/*${query}*`, '**/node_modules/**', 50);
+            if (this.searchToken !== token) return;
+
+            this.current.items = files.map(uri => ({
+                label: `$(file) ${OSPath.basename(uri.fsPath)}`,
+                description: vscode.workspace.asRelativePath(uri),
+                name: OSPath.basename(uri.fsPath),
+                alwaysShow: true,
+                action: Action.OpenGlobalFile,
+                payload: uri
+            } as FileItem));
+        } catch (e) {
+            console.error(e);
+        } finally {
+            if (this.searchToken === token) this.current.busy = false;
+        }
+    }
+
+    async handleGlobalFolderSearch(query: string) {
+        query = query.trim();
+        if (query.length < 1) {
+            this.current.items = [{ label: "Type to search folders globally...", name: "", alwaysShow: true } as FileItem];
+            return;
+        }
+
+        const token = ++this.searchToken;
+        this.current.busy = true;
+
+        try {
+            const files = await vscode.workspace.findFiles(`**/*${query}*/**`, '**/node_modules/**', 200);
+            if (this.searchToken !== token) return;
+
+            const dirSet = new Set<string>();
+            const dirs: Uri[] = [];
+
+            for (const f of files) {
+                const dirUri = Uri.joinPath(f, '..');
+                if (!dirSet.has(dirUri.fsPath)) {
+                    dirSet.add(dirUri.fsPath);
+                    dirs.push(dirUri);
+                }
+            }
+
+            this.current.items = dirs.map(uri => ({
+                label: `$(folder) ${OSPath.basename(uri.fsPath)}`,
+                description: vscode.workspace.asRelativePath(uri),
+                name: OSPath.basename(uri.fsPath),
+                alwaysShow: true,
+                fileType: FileType.Directory,
+                action: Action.OpenGlobalFolder,
+                payload: uri
+            } as FileItem));
+        } catch (e) {
+            console.error(e);
+        } finally {
+            if (this.searchToken === token) this.current.busy = false;
+        }
+    }
+
+    async handleGlobAndCreateSearch(value: string) {
+        const token = ++this.searchToken;
+        this.current.busy = true;
+
+        try {
+            const finalCreatePaths: { name: string, isDir: boolean }[] = [];
+            const existingMatches: { name: string, uri: Uri, type: FileType }[] = [];
             const braced = expandBraces(value);
 
+            let hasCreation = false;
+
             for (const pattern of braced) {
-                // 1. 识别末尾是否为目录创建请求
                 const isDirCreate = pattern.endsWith('/');
                 const cleanPattern = isDirCreate ? pattern.slice(0, -1) : pattern;
 
-                // 2. 找到最后一个斜杠，分割“路径通配符”与“文件名字面量”
+                // 1. 全局搜索已有项目 (Glob 搜索功能)
+                try {
+                    const matches = await expandPathWildcards(this.path.uri, cleanPattern, true, isDirCreate);
+                    for (const m of matches) {
+                        try {
+                            const stat = await vscode.workspace.fs.stat(m.uri);
+                            existingMatches.push({ name: m.name, uri: m.uri, type: stat.type });
+                        } catch (e) { }
+                    }
+                } catch (e) { }
+
+                // 2. 判定并解析创建意图
                 const lastSlashIdx = cleanPattern.lastIndexOf('/');
+                const dirPart = lastSlashIdx === -1 ? "" : cleanPattern.substring(0, lastSlashIdx);
+                const leafPart = lastSlashIdx === -1 ? cleanPattern : cleanPattern.substring(lastSlashIdx + 1);
 
-                if (lastSlashIdx === -1) {
-                    // 没有斜杠，整段都是文件名（字面量，即使含*也当字符）
-                    finalPaths.push(pattern);
+                // 如果叶子节点包含 * 或 ?，说明用户意图纯粹是搜索匹配文件，而不是创建名为 *.js 的文件
+                if (leafPart.includes('*') || leafPart.includes('?')) {
+                    continue;
+                }
+
+                // 只有叶子节点是明确字面量的，才生成创建预览
+                hasCreation = true;
+                if (dirPart === "") {
+                    finalCreatePaths.push({ name: cleanPattern, isDir: isDirCreate });
                 } else {
-                    const dirPart = cleanPattern.substring(0, lastSlashIdx);
-                    const leafPart = cleanPattern.substring(lastSlashIdx + 1);
-
-                    // 3. 展开父目录路径 (必须存在，或是根据逻辑生成的)
+                    // 父目录允许存在未创建的字面量（mustExist=false），但如果包含通配符则会动态展开存在的目录
                     const resolvedDirs = await expandPathWildcards(this.path.uri, dirPart, false, true);
-
                     for (const r of resolvedDirs) {
-                        // 在每个匹配到的线下，拼接字面量 leafPart
-                        const finalName = leafPart ? `${r.name}/${leafPart}` : r.name;
-                        finalPaths.push(isDirCreate && leafPart ? `${finalName}/` : finalName);
+                        const finalName = `${r.name}/${leafPart}`;
+                        finalCreatePaths.push({ name: finalName, isDir: isDirCreate });
                     }
                 }
             }
 
             if (this.searchToken !== token) return;
 
-            const newItem = {
-                label: `$(new-file) Create Pattern: ${value}`,
-                name: value,
-                description: "Directories expand, last part is literal",
-                alwaysShow: true,
-                action: Action.BulkCreate,
-                payload: value
-            } as FileItem;
+            const items: FileItem[] = [];
+            const uniqueExisting = new Set<string>();
 
-            const previews = finalPaths.map(p => ({
-                label: p.endsWith('/') ? `$(add) [Folder] ${p}` : `$(add) ${p}`,
-                name: p,
-                alwaysShow: true,
-                action: Action.Preview
-            } as FileItem));
+            // [第一优先级] 批量创建主命令 (如果有合法的创建意图)
+            if (hasCreation && finalCreatePaths.length > 0) {
+                items.push({
+                    label: `$(new-file) Create Pattern: ${value}`,
+                    name: value,
+                    description: "Execute bulk create",
+                    alwaysShow: true,
+                    action: Action.BulkCreate,
+                    payload: finalCreatePaths // 直接将解析好的路径数组传入
+                } as FileItem);
+            }
 
-            this.current.items = [newItem, ...previews];
+            // [第二优先级] 已经存在的匹配项 (允许直接打开或步入)
+            for (const m of existingMatches) {
+                if (!uniqueExisting.has(m.name)) {
+                    uniqueExisting.add(m.name);
+                    items.push({
+                        label: (m.type & FileType.Directory) ? `$(folder) ${m.name}` : `$(file) ${m.name}`,
+                        name: m.name,
+                        description: "Existing Match",
+                        alwaysShow: true,
+                        action: Action.OpenFile, // Action.OpenFile 支持步入文件夹和打开文件
+                        fileType: m.type
+                    } as FileItem);
+                }
+            }
+
+            // [第三优先级] 将被创建的单项预览 (过滤掉已存在的部分，并支持单项点击创建)
+            for (const p of finalCreatePaths) {
+                if (!uniqueExisting.has(p.name)) {
+                    items.push({
+                        label: p.isDir ? `$(add) [Folder] ${p.name}/` : `$(add) ${p.name}`,
+                        name: p.name,
+                        description: "Preview (Click to create single item)",
+                        alwaysShow: true,
+                        action: Action.SingleCreate, // 新增：可交互的单项创建
+                        payload: p
+                    } as FileItem);
+                }
+            }
+
+            this.current.items = items;
+            if (items.length > 0) this.current.activeItems = [items[0]];
+
         } catch (e) { }
         this.current.busy = false;
     }
@@ -469,10 +643,9 @@ class FileBrowser {
 
         if (parts.length > 0) {
             const matchPattern = parts[0];
-            const onlyDirs = matchPattern.endsWith('/'); // 核心修复：d: */ 只匹配目录
+            const onlyDirs = matchPattern.endsWith('/');
 
             try {
-                // 读取真实存在的 Glob 匹配文件/文件夹
                 const resolvedPaths = await expandPathWildcards(this.path.uri, matchPattern, true, onlyDirs);
                 if (this.searchToken !== token) return;
 
@@ -485,12 +658,17 @@ class FileBrowser {
                         const newBase = applyWildcard(oldBase, OSPath.basename(from), OSPath.basename(to)) || oldBase;
                         const dir = OSPath.dirname(p.name);
                         const displayNew = dir === "." ? newBase : `${dir}/${newBase}`;
+
+                        // 为单项重命名准备参数
+                        const newUri = Uri.joinPath(Uri.joinPath(p.uri, '..'), newBase);
+
                         return {
                             label: `$(arrow-right) ${p.name} -> ${displayNew}`,
                             name: p.name,
                             alwaysShow: true,
-                            description: "Will be renamed",
-                            action: Action.Preview
+                            description: "Click to rename this item only",
+                            action: Action.SingleRename,
+                            payload: { oldUri: p.uri, newUri }
                         } as FileItem;
                     });
                 } else if (action === Action.BulkDelete) {
@@ -500,35 +678,33 @@ class FileBrowser {
                         label: `$(trash) ${p.name}`,
                         name: p.name,
                         alwaysShow: true,
-                        action: Action.Preview
+                        description: "Click to delete this item only",
+                        action: Action.SingleDelete,
+                        payload: { uri: p.uri }
                     } as FileItem));
                 } else if (action === Action.BulkCopy && parts.length >= 2) {
                     label = `Copy '${parts[0]}' to '${parts[1]}'`;
                     payload = { match: parts[0], dest: parts[1] };
+                    const destBaseUri = this.path.append(...parts[1].split('/')).uri;
                     matchedFiles = resolvedPaths.map(p => ({
                         label: `$(files) ${p.name} -> ${parts[1]}/${OSPath.basename(p.name)}`,
                         name: p.name,
                         alwaysShow: true,
-                        description: "Will be copied",
-                        action: Action.Preview
+                        description: "Click to copy this item only",
+                        action: Action.SingleCopy,
+                        payload: { oldUri: p.uri, newUri: Uri.joinPath(destBaseUri, OSPath.basename(p.name)) }
                     } as FileItem));
                 } else if (action === Action.BulkMove && parts.length >= 2) {
                     label = `Move '${parts[0]}' to '${parts[1]}'`;
                     payload = { match: parts[0], dest: parts[1] };
+                    const destBaseUri = this.path.append(...parts[1].split('/')).uri;
                     matchedFiles = resolvedPaths.map(p => ({
                         label: `$(arrow-right) ${p.name} -> ${parts[1]}/${OSPath.basename(p.name)}`,
                         name: p.name,
                         alwaysShow: true,
-                        description: "Will be moved",
-                        action: Action.Preview
-                    } as FileItem));
-                } else {
-                    matchedFiles = resolvedPaths.map(p => ({
-                        label: `$(record) ${p.name}`,
-                        name: p.name,
-                        alwaysShow: true,
-                        description: "Matched path",
-                        action: Action.Preview
+                        description: "Click to move this item only",
+                        action: Action.SingleMove,
+                        payload: { oldUri: p.uri, newUri: Uri.joinPath(destBaseUri, OSPath.basename(p.name)) }
                     } as FileItem));
                 }
             } catch (e) { }
@@ -545,6 +721,7 @@ class FileBrowser {
         this.current.items = items;
         this.current.busy = false;
     }
+
     // ----------------------------
 
     onDidTriggerButton(button: QuickInputButton) {
@@ -663,40 +840,121 @@ class FileBrowser {
         vscode.workspace.openTextDocument(uri).then((doc) => vscode.window.showTextDocument(doc, column));
     }
 
-    async rename() { /* 保持原代码 */ }
+    async rename() {
+        const uri = this.path.uri;
+        const stat = await vscode.workspace.fs.stat(uri);
+        const isDir = (stat.type & FileType.Directory) === FileType.Directory;
+        const fileName = this.path.pop().getOrElse(() => { throw new Error("Can't rename an empty file name!"); });
+        const fileType = isDir ? "folder" : "file";
+        const workspaceFolder = this.path.getWorkspaceFolder().map((wsf) => wsf.uri);
+        const relPath = workspaceFolder.chain((wsf) => new Path(uri).relativeTo(wsf)).getOr(fileName);
+        const extension = OSPath.extname(relPath);
+        const startSelection = relPath.length - fileName.length;
+        const endSelection = startSelection + (fileName.length - extension.length);
+        const result = await vscode.window.showInputBox({
+            prompt: `Enter the new ${fileType} name`,
+            value: relPath,
+            valueSelection: [startSelection, endSelection],
+        });
+        this.file = Some(fileName);
+        if (result !== undefined) {
+            const newUri = workspaceFolder.match(
+                (wsf) => Uri.joinPath(wsf, result),
+                () => Uri.joinPath(this.path.uri, result)
+            );
+            if ((await Result.await(vscode.workspace.fs.rename(uri, newUri))).isOk()) {
+                this.file = Some(OSPath.basename(result));
+            } else {
+                vscode.window.showErrorMessage(`Failed to rename ${fileType} "${fileName}"`);
+            }
+        }
+    }
 
     async runAction(item: FileItem) {
         switch (item.action) {
-            case Action.Preview: break;
-            case Action.GoToLine: { /* 保持原代码 */ break; }
-            case Action.GoToSymbol: { /* 保持原代码 */ break; }
-            case Action.OpenGlobalFile: { /* 保持原代码 */ break; }
-            case Action.OpenGlobalFolder: { /* 保持原代码 */ break; }
-            case Action.BulkCreate: {
-                const braced = expandBraces(item.payload);
-                for (const pattern of braced) {
-                    const isDirCreate = pattern.endsWith('/');
-                    const clean = isDirCreate ? pattern.slice(0, -1) : pattern;
-                    const lastSlash = clean.lastIndexOf('/');
+            case Action.GoToLine: {
+                const line = item.payload - 1;
+                this.dispose();
+                if (this.editorUri) {
+                    vscode.workspace.openTextDocument(this.editorUri).then(doc => {
+                        vscode.window.showTextDocument(doc).then(editor => {
+                            const range = doc.lineAt(Math.max(0, Math.min(line, doc.lineCount - 1))).range;
+                            editor.selection = new vscode.Selection(range.start, range.start);
+                            editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
+                        });
+                    });
+                }
+                break;
+            }
+            case Action.GoToSymbol: {
+                const payload = item.payload as { uri: Uri, range: vscode.Range };
+                this.dispose();
+                vscode.workspace.openTextDocument(payload.uri).then(doc => {
+                    vscode.window.showTextDocument(doc).then(editor => {
+                        editor.selection = new vscode.Selection(payload.range.start, payload.range.start);
+                        editor.revealRange(payload.range, vscode.TextEditorRevealType.InCenter);
+                    });
+                });
+                break;
+            }
+            case Action.OpenGlobalFile: {
+                this.openFile(item.payload as Uri);
+                break;
+            }
+            case Action.OpenGlobalFolder: {
+                this.searchModeState = { mode: this.current.value, path: new Path(item.payload) };
+                this.current.value = "";
+                await this.stepIntoFolder(new Path(item.payload));
+                break;
+            }
+            case Action.SingleCreate: {
+                const { name, isDir } = item.payload;
+                const uri = Uri.joinPath(this.path.uri, ...name.split('/'));
+                if (isDir) {
+                    await vscode.workspace.fs.createDirectory(uri);
+                    this.current.value = "";
+                    await this.update();
+                } else {
+                    await vscode.workspace.fs.createDirectory(Uri.joinPath(uri, '..'));
+                    this.openFile(uri.with({ scheme: "untitled" }), ViewColumn.Active);
+                }
+                break;
+            }
+            case Action.SingleRename:
+            case Action.SingleMove: {
+                const { oldUri, newUri } = item.payload;
+                await vscode.workspace.fs.createDirectory(Uri.joinPath(newUri, '..'));
+                await vscode.workspace.fs.rename(oldUri, newUri);
+                this.current.value = "";
+                await this.update();
+                break;
+            }
+            case Action.SingleCopy: {
+                const { oldUri, newUri } = item.payload;
+                await vscode.workspace.fs.createDirectory(Uri.joinPath(newUri, '..'));
+                await vscode.workspace.fs.copy(oldUri, newUri);
+                this.current.value = "";
+                await this.update();
+                break;
+            }
+            case Action.SingleDelete: {
+                const { uri } = item.payload;
+                await vscode.workspace.fs.delete(uri, { recursive: true, useTrash: true });
+                this.current.value = "";
+                await this.update();
+                break;
+            }
 
-                    if (lastSlash === -1) {
-                        // 根目录下创建
-                        const uri = Uri.joinPath(this.path.uri, clean);
-                        if (isDirCreate) await vscode.workspace.fs.createDirectory(uri);
-                        else await vscode.workspace.fs.writeFile(uri, new Uint8Array(0));
+            case Action.BulkCreate: {
+                // 已在上游解析为具体路径，直接迭代即可
+                const paths: { name: string, isDir: boolean }[] = item.payload;
+                for (const p of paths) {
+                    const uri = Uri.joinPath(this.path.uri, ...p.name.split('/'));
+                    if (p.isDir) {
+                        await vscode.workspace.fs.createDirectory(uri);
                     } else {
-                        const dirPart = clean.substring(0, lastSlash);
-                        const leafPart = clean.substring(lastSlash + 1);
-                        const resolved = await expandPathWildcards(this.path.uri, dirPart, false, true);
-                        for (const r of resolved) {
-                            const uri = leafPart ? Uri.joinPath(r.uri, leafPart) : r.uri;
-                            if (isDirCreate) {
-                                await vscode.workspace.fs.createDirectory(uri);
-                            } else {
-                                await vscode.workspace.fs.createDirectory(Uri.joinPath(uri, '..'));
-                                await vscode.workspace.fs.writeFile(uri, new Uint8Array(0));
-                            }
-                        }
+                        await vscode.workspace.fs.createDirectory(Uri.joinPath(uri, '..'));
+                        await vscode.workspace.fs.writeFile(uri, new Uint8Array(0));
                     }
                 }
                 this.current.value = "";
@@ -793,10 +1051,44 @@ class FileBrowser {
                 }
                 break;
             }
-            case Action.RenameFile: { /* 保持原代码 */ break; }
-            case Action.DeleteFile: { /* 保持原代码 */ break; }
-            case Action.OpenFolder: { /* 保持原代码 */ break; }
-            case Action.OpenFolderInNewWindow: { /* 保持原代码 */ break; }
+            case Action.RenameFile: {
+                this.keepAlive = true;
+                this.hide();
+                await this.rename();
+                this.show();
+                this.keepAlive = false;
+                this.inActions = false;
+                this.update();
+                break;
+            }
+            case Action.DeleteFile: {
+                this.keepAlive = true;
+                this.hide();
+                const uri = this.path.uri;
+                const stat = await vscode.workspace.fs.stat(uri);
+                const isDir = (stat.type & FileType.Directory) === FileType.Directory;
+                const fileName = this.path.pop().getOrElse(() => { throw new Error("Can't delete an empty file name!"); });
+                const fileType = isDir ? "folder" : "file";
+                const goAhead = `$(trash) Delete the ${fileType} "${fileName}"`;
+                const result = await vscode.window.showQuickPick(["$(close) Cancel", goAhead], {});
+                if (result === goAhead) {
+                    const delOp = await Result.await(vscode.workspace.fs.delete(uri, { recursive: isDir, useTrash: true }));
+                    if (delOp.isErr()) vscode.window.showErrorMessage(`Failed to delete ${fileType} "${fileName}"`);
+                }
+                this.show();
+                this.keepAlive = false;
+                this.inActions = false;
+                this.update();
+                break;
+            }
+            case Action.OpenFolder: {
+                vscode.commands.executeCommand("vscode.openFolder", this.path.uri);
+                break;
+            }
+            case Action.OpenFolderInNewWindow: {
+                vscode.commands.executeCommand("vscode.openFolder", this.path.uri, true);
+                break;
+            }
             default:
                 throw new Error(`Unhandled action ${item.action}`);
         }

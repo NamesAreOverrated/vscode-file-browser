@@ -1,3 +1,4 @@
+// --- START OF FILE action.ts ---
 export enum Action {
     NewFile,
     NewFolder,
@@ -8,7 +9,7 @@ export enum Action {
     OpenFolder,
     OpenFolderInNewWindow,
 
-    // ======== 新增的 Action ========
+    // ======== 批量操作 Action ========
     GoToSymbol,
     GoToLine,
     OpenGlobalFile,
@@ -19,7 +20,12 @@ export enum Action {
     BulkMove,
     BulkDelete,
 
-    Preview // 新增：哑操作，用于模式匹配下的文件预览项
+    // ======== 新增：单项预览的执行 Action ========
+    SingleCreate,
+    SingleRename,
+    SingleCopy,
+    SingleMove,
+    SingleDelete
 }
 
 export function action(label: string, action: Action, payload?: any) {
