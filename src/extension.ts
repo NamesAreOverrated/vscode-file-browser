@@ -477,8 +477,8 @@ class FileBrowser {
                 description: vscode.workspace.asRelativePath(uri),
                 name: OSPath.basename(uri.fsPath),
                 alwaysShow: true,
-                action: Action.OpenGlobalFile,
-                payload: uri
+                payload: uri,
+                fileType: FileType.File,
             } as FileItem));
         } catch (e) {
             console.error(e);
