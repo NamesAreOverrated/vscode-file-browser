@@ -11,6 +11,21 @@ import { action, Action } from "./action";
 
 // ================= 工具函数 =================
 
+// 文本搜索的高亮：使用原生的“查找匹配”颜色
+const searchDecorationType = vscode.window.createTextEditorDecorationType({
+    backgroundColor: new vscode.ThemeColor('editor.findMatchHighlightBackground'),
+    overviewRulerColor: new vscode.ThemeColor('editor.findMatchHighlightBackground'),
+    overviewRulerLane: vscode.OverviewRulerLane.Center,
+    border: '1px solid rgba(255, 255, 0, 0.2)',
+    borderRadius: '2px'
+});
+
+// 符号/行跳转的高亮：使用原生的“整行/区域”背景高亮
+const rangeDecorationType = vscode.window.createTextEditorDecorationType({
+    backgroundColor: new vscode.ThemeColor('editor.rangeHighlightBackground'),
+    isWholeLine: true, // 符号跳转通常高亮整行或整个区域
+});
+
 function getSymbolIcon(kind: vscode.SymbolKind): string {
     switch (kind) {
         case vscode.SymbolKind.Class: return "$(symbol-class)";
@@ -225,23 +240,16 @@ class FileBrowser {
     // ================= Preview =================
     private previewTimeout?: NodeJS.Timeout;
     private lastPreviewUri?: Uri;
-
     private async preview(item: FileItem) {
-        // 1. 如果处于 Action 菜单中，什么都不要做，原样保持当前文件的 Preview
-        if (this.inActions) {
-            return;
-        }
+        if (this.inActions) return;
 
-        // 2. 只有这几种特定 action 我们允许提供 preview（符号/行号搜索）
-        const canPreview = item.action === undefined || item.action === Action.GoToSymbol || item.action === Action.GoToLine;
-        if (!canPreview) {
-            this.closePreviewTab();
-            return;
-        }
+        const canPreview = item.action === undefined ||
+            item.action === Action.GoToLine ||
+            item.action === Action.OpenFile;
 
-        // 3. 文件夹不预览
-        if (item.fileType !== undefined && (item.fileType & FileType.Directory)) {
+        if (!canPreview || (item.fileType !== undefined && (item.fileType & FileType.Directory))) {
             this.closePreviewTab();
+            this.clearDecorations();
             return;
         }
 
@@ -250,22 +258,21 @@ class FileBrowser {
         this.previewTimeout = setTimeout(async () => {
             let uri: Uri | undefined;
             let range: vscode.Range | undefined;
+            let selectionRange: vscode.Range | undefined;
 
-            if (item.payload) {
-                if (item.payload instanceof vscode.Uri) {
-                    uri = item.payload;
-                } else if (item.payload.uri) {
-                    uri = typeof item.payload.uri.scheme === 'string' ? vscode.Uri.from(item.payload.uri) : item.payload.uri;
-                    range = item.payload.range;
-                } else if (typeof item.payload.scheme === 'string') {
-                    uri = vscode.Uri.from(item.payload);
-                }
-            } else if (item.name && item.fileType !== undefined) {
+            // 解析 payload
+            if (item.payload?.uri) {
+                uri = item.payload.uri;
+                range = item.payload.range;
+                selectionRange = item.payload.selectionRange;
+            } else if (item.payload instanceof Uri) {
+                uri = item.payload;
+            } else if (item.name && !item.action) {
                 uri = this.path.append(item.name).uri;
             }
 
+
             if (!uri) {
-                this.closePreviewTab();
                 return;
             }
 
@@ -279,21 +286,41 @@ class FileBrowser {
             }
 
             try {
-                if (uri.scheme === 'file' || uri.scheme === 'vscode-remote') {
-                    // 永远在 Beside 打开 preview，不干扰用户当前的活动编辑器栏位
-                    const editor = await vscode.window.showTextDocument(uri, {
-                        preview: true,
-                        preserveFocus: true,
-                        viewColumn: targetColumn
-                    });
+                const editor = await vscode.window.showTextDocument(uri, {
+                    preview: true,
+                    preserveFocus: true,
+                    viewColumn: targetColumn
+                });
 
-                    if (range) {
-                        editor.selection = new vscode.Selection(range.start, range.start);
-                        editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
+
+                if (range && !editor.selection.active.isEqual(range.start)) {
+                    this.clearDecorations();
+                    // 1. 设置光标位置（Selection）
+                    const targetPos = selectionRange || range;
+                    editor.selection = new vscode.Selection(targetPos.start, targetPos.end);
+
+                    // 2. 应用装饰器高亮（Decoration）
+                    if (item.action === Action.GoToLine) {
+                        // 符号跳转：高亮整个区域（或整行）
+                        editor.setDecorations(rangeDecorationType, [range]);
+                    } else {
+                        // 文本搜索：只高亮匹配的词
+                        editor.setDecorations(searchDecorationType, [range]);
                     }
+
+                    // 3. 滚动到视图
+                    editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
                 }
             } catch (e) { }
         }, 150);
+    }
+
+    // 辅助方法：清除所有高亮
+    private clearDecorations() {
+        vscode.window.visibleTextEditors.forEach(editor => {
+            editor.setDecorations(searchDecorationType, []);
+            editor.setDecorations(rangeDecorationType, []);
+        });
     }
 
     private closePreviewTab() {
@@ -576,8 +603,11 @@ class FileBrowser {
                     if (this.searchToken !== token) return;
                     for (let i = 0; i < doc.lineCount; i++) {
                         const line = doc.lineAt(i);
-                        if (line.text.toLowerCase().includes(q)) {
-                            results.push(this.createTextMatchItem(doc.uri, line.text, i, line.range));
+                        const index = line.text.toLowerCase().indexOf(q);
+                        if (index !== -1) {
+                            // 精确计算关键词范围
+                            const matchRange = new vscode.Range(i, index, i, index + q.length);
+                            results.push(this.createTextMatchItem(doc.uri, line.text, i, matchRange));
                         }
                     }
                 }
@@ -598,9 +628,11 @@ class FileBrowser {
                             const lines = text.split(/\r?\n/);
                             for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
                                 const lineText = lines[lineIdx];
-                                if (lineText.toLowerCase().includes(q)) {
-                                    const range = new vscode.Range(lineIdx, 0, lineIdx, lineText.length);
-                                    results.push(this.createTextMatchItem(uri, lineText, lineIdx, range));
+                                const index = lineText.toLowerCase().indexOf(q);
+                                if (index !== -1) {
+                                    // 精确计算关键词范围
+                                    const matchRange = new vscode.Range(lineIdx, index, lineIdx, index + q.length);
+                                    results.push(this.createTextMatchItem(uri, lineText, lineIdx, matchRange));
                                 }
                             }
                         } catch (e) { /* skip */ }
@@ -614,7 +646,6 @@ class FileBrowser {
             if (this.searchToken === token) this.current.busy = false;
         }
     }
-
 
     private createTextMatchItem(uri: Uri, text: string, lineIdx: number, range: vscode.Range): FileItem {
         const cleanText = text.trim().replace(/\s+/g, ' ');
@@ -734,8 +765,15 @@ class FileBrowser {
             const filtered = flatSymbols.filter(s => s.name.toLowerCase().includes(q));
 
             this.current.items = filtered.map(s => ({
-                label: `${getSymbolIcon(s.kind)} ${s.name}`, name: s.name, description: `Line ${s.range.start.line + 1}`,
-                alwaysShow: true, payload: { uri: this.editorUri, range: s.range },
+                label: `${getSymbolIcon(s.kind)} ${s.name}`,
+                name: s.name,
+                description: `Line ${s.range.start.line + 1}`,
+                alwaysShow: true,
+                payload: {
+                    uri: this.editorUri,
+                    range: s.range,
+                    selectionRange: s.selectionRange
+                },
                 fileType: FileType.File,
             } as FileItem));
         } catch (e) { } finally {
@@ -749,19 +787,15 @@ class FileBrowser {
             this.current.items = [{ label: "Type at least 2 chars to search workspace symbols...", name: "", alwaysShow: true } as FileItem];
             return;
         }
-
         const token = ++this.searchToken;
         this.current.busy = true;
-
         try {
             const symbols = await vscode.commands.executeCommand<vscode.SymbolInformation[]>('vscode.executeWorkspaceSymbolProvider', query);
             if (this.searchToken !== token) return;
-
             if (!symbols || symbols.length === 0) {
                 this.current.items = [{ label: "No symbols found in workspace.", name: "", alwaysShow: true } as FileItem];
                 return;
             }
-
             const importantKinds = new Set([
                 vscode.SymbolKind.Class,
                 vscode.SymbolKind.Method,
@@ -786,10 +820,14 @@ class FileBrowser {
                     description: `${container}${path} : ${s.location.range.start.line + 1}`,
                     alwaysShow: true,
                     fileType: FileType.File,
-                    payload: { uri: s.location.uri, range: s.location.range }
+
+                    payload: {
+                        uri: s.location.uri,
+                        range: s.location.range,
+                        selectionRange: new vscode.Range(s.location.range.start, s.location.range.start)
+                    }
                 } as FileItem;
             });
-
             if (this.current.items.length === 0) {
                 this.current.items = [{ label: "No important symbols found.", name: "", alwaysShow: true } as FileItem];
             }
@@ -1046,7 +1084,12 @@ class FileBrowser {
 
     // ================= 文件操作与执行 (Actions) =================
 
-    openFile(uri: Uri, column?: ViewColumn, range?: vscode.Range) {
+    openFile(uri: Uri, column?: ViewColumn, range?: vscode.Range, selectionRange?: vscode.Range) {
+        if (this.previewTimeout) {
+            clearTimeout(this.previewTimeout);
+            this.previewTimeout = undefined;
+        }
+        this.clearDecorations();
         let targetColumn = column;
         if (!targetColumn) {
             for (const group of vscode.window.tabGroups.all) {
@@ -1071,8 +1114,17 @@ class FileBrowser {
                 preview: false
             }).then(editor => {
                 if (range) {
-                    editor.selection = new vscode.Selection(range.start, range.start);
+                    const targetSelection = selectionRange || range;
+                    editor.selection = new vscode.Selection(targetSelection.start, targetSelection.end);
                     editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
+
+                    /* 
+                                        setTimeout(() => {
+                                            if (editor.document === doc) {
+                                                editor.selection = new vscode.Selection(targetSelection.start, targetSelection.end);
+                                                editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
+                                            }
+                                        }, 50); */
                 }
             });
         });
@@ -1132,10 +1184,9 @@ class FileBrowser {
     async runAction(item: FileItem) {
         try {
             switch (item.action) {
-                case Action.GoToLine:
-                case Action.GoToSymbol: {
-                    const payload = item.payload as { uri: Uri, range: vscode.Range };
-                    this.openFile(payload.uri, undefined, payload.range);
+                case Action.GoToLine: {
+                    const payload = item.payload as { uri: Uri, range: vscode.Range, selectionRange?: vscode.Range };
+                    this.openFile(payload.uri, undefined, payload.range, payload.selectionRange);
                     break;
                 }
                 case Action.SingleCreate: {
@@ -1253,13 +1304,14 @@ class FileBrowser {
                 case Action.OpenFileBeside: {
                     let targetUri = this.path.clone().uri;
                     let targetRange: vscode.Range | undefined;
-
+                    let targetSelection: vscode.Range | undefined;
                     if (item.payload) {
                         if (item.payload instanceof Uri) {
                             targetUri = item.payload;
                         } else if (item.payload.uri) {
                             targetUri = item.payload.uri;
                             targetRange = item.payload.range;
+                            targetSelection = item.payload.selectionRange;
                         }
                     } else if (item.name && item.name.length > 0) {
                         targetUri = this.path.clone().append(...item.name.split('/')).uri;
@@ -1274,7 +1326,7 @@ class FileBrowser {
                         }
 
                         const targetCol = item.action === Action.OpenFileBeside ? ViewColumn.Beside : undefined;
-                        this.openFile(targetUri, targetCol, targetRange);
+                        this.openFile(targetUri, targetCol, targetRange, targetSelection);
                     } catch (e) {
                         if (item.name.endsWith('/')) {
                             await vscode.workspace.fs.createDirectory(targetUri);

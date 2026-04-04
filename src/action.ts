@@ -9,7 +9,6 @@ export enum Action {
     OpenFolderInNewWindow,
 
     // ======== 批量/搜索 Action ========
-    GoToSymbol,
     GoToLine,
     BulkCreate,
     BulkRename,
