@@ -1,9 +1,9 @@
 {
-    "name": "file-browser",
+    "name": "file-browser-plus",
     "publisher": "NamesAreOverrated",
     "displayName": "File Browser",
     "description": "A nicer alternative to the file open dialog.",
-    "version": "0.0.1",
+    "version": "1.0.0",
     "license": "LGPL-3.0+",
     "author": {
         "name": "NamesAreOverrated"

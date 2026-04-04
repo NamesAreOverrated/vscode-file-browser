@@ -907,227 +907,314 @@ class FileBrowser {
         }
     }
 
+    /**
+   * Helper to handle UI state when showing VS Code dialogs.
+   * Prevents the QuickPick from disposing while the user is interacting with a message box.
+   */
+    private async confirmAction(message: string, detail?: string, isDestructive: boolean = false): Promise<boolean> {
+        this.keepAlive = true;
+        this.current.hide();
+
+        const options: vscode.MessageOptions = { modal: true, detail };
+        const items = isDestructive ? ["Proceed", "Cancel"] : ["Yes", "No"];
+
+        const result = isDestructive
+            ? await vscode.window.showWarningMessage(message, options, "Confirm")
+            : await vscode.window.showInformationMessage(message, options, "Yes");
+
+        this.current.show();
+        this.keepAlive = false;
+        return result === "Confirm" || result === "Yes";
+    }
+
+    /**
+     * Check if a file exists and ask to overwrite if necessary.
+     */
+    private async ensureSafeWrite(uri: Uri): Promise<"ok" | "skip" | "cancel"> {
+        try {
+            await vscode.workspace.fs.stat(uri);
+            // If we reach here, file exists
+            this.keepAlive = true;
+            this.current.hide();
+            const choice = await vscode.window.showWarningMessage(
+                `File already exists: ${OSPath.basename(uri.fsPath)}`,
+                { modal: true, detail: "Do you want to overwrite it?" },
+                "Overwrite", "Skip"
+            );
+            this.current.show();
+            this.keepAlive = false;
+
+            if (choice === "Overwrite") return "ok";
+            if (choice === "Skip") return "skip";
+            return "cancel";
+        } catch {
+            return "ok"; // File doesn't exist
+        }
+    }
+
     async runAction(item: FileItem) {
-        switch (item.action) {
-            case Action.GoToLine: {
-                const line = item.payload - 1;
-                this.dispose();
-                if (this.editorUri) {
-                    vscode.workspace.openTextDocument(this.editorUri).then(doc => {
+        try {
+            switch (item.action) {
+                case Action.GoToLine: {
+                    const line = item.payload - 1;
+                    this.dispose();
+                    if (this.editorUri) {
+                        vscode.workspace.openTextDocument(this.editorUri).then(doc => {
+                            vscode.window.showTextDocument(doc).then(editor => {
+                                const range = doc.lineAt(Math.max(0, Math.min(line, doc.lineCount - 1))).range;
+                                editor.selection = new vscode.Selection(range.start, range.start);
+                                editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
+                            });
+                        });
+                    }
+                    break;
+                }
+                case Action.GoToSymbol: {
+                    const payload = item.payload as { uri: Uri, range: vscode.Range };
+                    this.dispose();
+                    vscode.workspace.openTextDocument(payload.uri).then(doc => {
                         vscode.window.showTextDocument(doc).then(editor => {
-                            const range = doc.lineAt(Math.max(0, Math.min(line, doc.lineCount - 1))).range;
-                            editor.selection = new vscode.Selection(range.start, range.start);
-                            editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
+                            editor.selection = new vscode.Selection(payload.range.start, payload.range.start);
+                            editor.revealRange(payload.range, vscode.TextEditorRevealType.InCenter);
                         });
                     });
+                    break;
                 }
-                break;
-            }
-            case Action.GoToSymbol: {
-                const payload = item.payload as { uri: Uri, range: vscode.Range };
-                this.dispose();
-                vscode.workspace.openTextDocument(payload.uri).then(doc => {
-                    vscode.window.showTextDocument(doc).then(editor => {
-                        editor.selection = new vscode.Selection(payload.range.start, payload.range.start);
-                        editor.revealRange(payload.range, vscode.TextEditorRevealType.InCenter);
-                    });
-                });
-                break;
-            }
-            case Action.OpenGlobalFile: {
-                this.openFile(item.payload as Uri);
-                break;
-            }
-            case Action.OpenGlobalFolder: {
-                this.searchModeState = { mode: this.current.value, path: new Path(item.payload) };
-                this.current.value = "";
-                await this.stepIntoFolder(new Path(item.payload));
-                break;
-            }
-            case Action.SingleCreate: {
-                const { name, isDir } = item.payload;
-                const uri = Uri.joinPath(this.path.uri, ...name.split('/'));
-                if (isDir) {
-                    await vscode.workspace.fs.createDirectory(uri);
+                case Action.OpenGlobalFile: {
+                    this.openFile(item.payload as Uri);
+                    break;
+                }
+                case Action.OpenGlobalFolder: {
+                    this.searchModeState = { mode: this.current.value, path: new Path(item.payload) };
+                    this.current.value = "";
+                    await this.stepIntoFolder(new Path(item.payload));
+                    break;
+                }
+                case Action.SingleCreate: {
+                    const { name, isDir } = item.payload;
+                    const uri = Uri.joinPath(this.path.uri, ...name.split('/'));
+
+                    if (isDir) {
+                        await vscode.workspace.fs.createDirectory(uri);
+                    } else {
+                        const safety = await this.ensureSafeWrite(uri);
+                        if (safety !== "ok") return;
+                        await vscode.workspace.fs.createDirectory(Uri.joinPath(uri, '..'));
+                        // Create empty file if it doesn't exist to allow opening
+                        await vscode.workspace.fs.writeFile(uri, new Uint8Array(0));
+                        this.openFile(uri, ViewColumn.Active);
+                    }
                     this.current.value = "";
                     await this.update();
-                } else {
-                    await vscode.workspace.fs.createDirectory(Uri.joinPath(uri, '..'));
-                    this.openFile(uri.with({ scheme: "untitled" }), ViewColumn.Active);
+                    break;
                 }
-                break;
-            }
-            case Action.SingleRename:
-            case Action.SingleMove: {
-                const { oldUri, newUri } = item.payload;
-                await vscode.workspace.fs.createDirectory(Uri.joinPath(newUri, '..'));
-                await vscode.workspace.fs.rename(oldUri, newUri);
-                this.current.value = "";
-                await this.update();
-                break;
-            }
-            case Action.SingleCopy: {
-                const { oldUri, newUri } = item.payload;
-                await vscode.workspace.fs.createDirectory(Uri.joinPath(newUri, '..'));
-                await vscode.workspace.fs.copy(oldUri, newUri);
-                this.current.value = "";
-                await this.update();
-                break;
-            }
-            case Action.SingleDelete: {
-                const { uri } = item.payload;
-                await vscode.workspace.fs.delete(uri, { recursive: true, useTrash: true });
-                this.current.value = "";
-                await this.update();
-                break;
-            }
+                case Action.SingleRename:
+                case Action.SingleMove:
+                case Action.SingleCopy: {
+                    const { oldUri, newUri } = item.payload;
+                    const isCopy = item.action === Action.SingleCopy;
 
-            case Action.BulkCreate: {
-                // 已在上游解析为具体路径，直接迭代即可
-                const paths: { name: string, isDir: boolean }[] = item.payload;
-                for (const p of paths) {
-                    const uri = Uri.joinPath(this.path.uri, ...p.name.split('/'));
-                    if (p.isDir) {
-                        await vscode.workspace.fs.createDirectory(uri);
+                    const safety = await this.ensureSafeWrite(newUri);
+                    if (safety !== "ok") return;
+
+                    await vscode.workspace.fs.createDirectory(Uri.joinPath(newUri, '..'));
+                    if (isCopy) {
+                        await vscode.workspace.fs.copy(oldUri, newUri, { overwrite: true });
                     } else {
-                        await vscode.workspace.fs.createDirectory(Uri.joinPath(uri, '..'));
-                        await vscode.workspace.fs.writeFile(uri, new Uint8Array(0));
+                        await vscode.workspace.fs.rename(oldUri, newUri, { overwrite: true });
                     }
+                    this.current.value = "";
+                    await this.update();
+                    break;
                 }
-                this.current.value = "";
-                await this.update();
-                break;
-            }
-            case Action.BulkRename: {
-                const { from, to } = item.payload;
-                const resolved = await expandPathWildcards(this.path.uri, from, true);
-                for (const r of resolved) {
-                    const oldBase = OSPath.basename(r.name);
-                    const newBase = applyWildcard(oldBase, OSPath.basename(from), OSPath.basename(to)) || oldBase;
-                    if (newBase !== oldBase) {
-                        const oldUri = r.uri;
-                        const newUri = Uri.joinPath(Uri.joinPath(oldUri, '..'), newBase);
-                        await vscode.workspace.fs.rename(oldUri, newUri);
-                    }
-                }
-                this.current.value = "";
-                await this.update();
-                break;
-            }
-            case Action.BulkDelete: {
-                const { match } = item.payload;
-                const resolved = await expandPathWildcards(this.path.uri, match, true);
-                for (const r of resolved) {
-                    await vscode.workspace.fs.delete(r.uri, { recursive: true, useTrash: true });
-                }
-                this.current.value = "";
-                await this.update();
-                break;
-            }
-            case Action.BulkMove:
-            case Action.BulkCopy: {
-                const { match, dest } = item.payload;
-                const resolved = await expandPathWildcards(this.path.uri, match, true);
-                const destBaseUri = this.path.append(...dest.split('/')).uri;
-                await vscode.workspace.fs.createDirectory(destBaseUri);
 
-                for (const r of resolved) {
-                    const oldUri = r.uri;
-                    const newUri = Uri.joinPath(destBaseUri, OSPath.basename(r.name));
-                    if (item.action === Action.BulkMove) {
-                        await vscode.workspace.fs.rename(oldUri, newUri);
-                    } else {
-                        await vscode.workspace.fs.copy(oldUri, newUri);
-                    }
-                }
-                this.current.value = "";
-                await this.update();
-                break;
-            }
-
-            case Action.NewFolder: {
-                await vscode.workspace.fs.createDirectory(this.path.uri);
-                await this.update();
-                break;
-            }
-            case Action.NewFile: {
-                // 已被 OpenFile 吸收，这里可以留空或复用
-                break;
-            }
-            case Action.OpenFile:
-            case Action.OpenFileBeside: {
-                // 【核心增强】完美支持全路径的递归创建与跳转
-                const path = this.path.clone();
-                if (item.name && item.name.length > 0) {
-                    path.push(...item.name.split('/'));
-                }
-                const uri = path.uri;
-
-                try {
-                    const stat = await vscode.workspace.fs.stat(uri);
-                    if ((stat.type & FileType.Directory) === FileType.Directory) {
-                        // 如果用户敲入了 a/b/ 的目录并回车，隐式钻取进去
-                        await this.stepIntoFolder(path);
-                        return;
-                    }
-                    this.openFile(uri, item.action === Action.OpenFileBeside ? ViewColumn.Beside : ViewColumn.Active);
-                } catch (e) {
-                    // 如果路径不存在，自动递归创建所有的父级目录，并建立新文件
-                    const parts = item.name.split('/');
-                    if (parts.length > 1) {
-                        await vscode.workspace.fs.createDirectory(Uri.joinPath(uri, '..'));
-                    }
-                    // 文件以untitled形式开出 (如果是末尾带斜线的输入，上面就已经捕获并只创建文件夹了)
-                    if (!item.name.endsWith('/')) {
-                        this.openFile(uri.with({ scheme: "untitled" }), item.action === Action.OpenFileBeside ? ViewColumn.Beside : ViewColumn.Active);
-                    } else {
-                        await vscode.workspace.fs.createDirectory(uri);
+                case Action.SingleDelete: {
+                    const { uri } = item.payload;
+                    const confirmed = await this.confirmAction(
+                        `Delete ${OSPath.basename(uri.fsPath)}?`,
+                        "This will move the item to the trash.",
+                        true
+                    );
+                    if (confirmed) {
+                        await vscode.workspace.fs.delete(uri, { recursive: true, useTrash: true });
                         this.current.value = "";
                         await this.update();
                     }
+                    break;
                 }
-                break;
-            }
-            case Action.RenameFile: {
-                this.keepAlive = true;
-                this.hide();
-                await this.rename();
-                this.show();
-                this.keepAlive = false;
-                this.inActions = false;
-                this.update();
-                break;
-            }
-            case Action.DeleteFile: {
-                this.keepAlive = true;
-                this.hide();
-                const uri = this.path.uri;
-                const stat = await vscode.workspace.fs.stat(uri);
-                const isDir = (stat.type & FileType.Directory) === FileType.Directory;
-                const fileName = this.path.pop().getOrElse(() => { throw new Error("Can't delete an empty file name!"); });
-                const fileType = isDir ? "folder" : "file";
-                const goAhead = `$(trash) Delete the ${fileType} "${fileName}"`;
-                const result = await vscode.window.showQuickPick(["$(close) Cancel", goAhead], {});
-                if (result === goAhead) {
-                    const delOp = await Result.await(vscode.workspace.fs.delete(uri, { recursive: isDir, useTrash: true }));
-                    if (delOp.isErr()) vscode.window.showErrorMessage(`Failed to delete ${fileType} "${fileName}"`);
+                case Action.BulkCreate: {
+                    const paths: { name: string, isDir: boolean }[] = item.payload;
+                    if (paths.length > 10) {
+                        const ok = await this.confirmAction(`Create ${paths.length} items?`);
+                        if (!ok) return;
+                    }
+
+                    for (const p of paths) {
+                        const uri = Uri.joinPath(this.path.uri, ...p.name.split('/'));
+                        await vscode.workspace.fs.createDirectory(Uri.joinPath(uri, '..'));
+                        if (p.isDir) {
+                            await vscode.workspace.fs.createDirectory(uri);
+                        } else {
+                            // Only create if not exists to avoid wiping content
+                            try { await vscode.workspace.fs.stat(uri); }
+                            catch { await vscode.workspace.fs.writeFile(uri, new Uint8Array(0)); }
+                        }
+                    }
+                    this.current.value = "";
+                    await this.update();
+                    break;
                 }
-                this.show();
-                this.keepAlive = false;
-                this.inActions = false;
-                this.update();
-                break;
+
+                case Action.BulkRename: {
+                    const { from, to } = item.payload;
+                    const resolved = await expandPathWildcards(this.path.uri, from, true);
+
+                    if (resolved.length === 0) return;
+                    if (!await this.confirmAction(`Rename ${resolved.length} matching items?`)) return;
+
+                    for (const r of resolved) {
+                        const oldBase = OSPath.basename(r.name);
+                        const newBase = applyWildcard(oldBase, OSPath.basename(from), OSPath.basename(to)) || oldBase;
+                        if (newBase !== oldBase) {
+                            const newUri = Uri.joinPath(Uri.joinPath(r.uri, '..'), newBase);
+                            // Bulk renames skip existing files to avoid accidental mass-overwrite
+                            try {
+                                await vscode.workspace.fs.stat(newUri);
+                                console.warn(`Skipped renaming ${oldBase} as ${newBase} already exists.`);
+                            } catch {
+                                await vscode.workspace.fs.rename(r.uri, newUri);
+                            }
+                        }
+                    }
+                    this.current.value = "";
+                    await this.update();
+                    break;
+                }
+                case Action.BulkDelete: {
+                    const { match } = item.payload;
+                    const resolved = await expandPathWildcards(this.path.uri, match, true);
+                    if (resolved.length === 0) return;
+
+                    const confirmed = await this.confirmAction(
+                        `Delete ${resolved.length} items?`,
+                        `Patterns: ${match}\nAll items will be moved to trash.`,
+                        true
+                    );
+                    if (confirmed) {
+                        for (const r of resolved) {
+                            await vscode.workspace.fs.delete(r.uri, { recursive: true, useTrash: true });
+                        }
+                        this.current.value = "";
+                        await this.update();
+                    }
+                    break;
+                }
+                case Action.BulkMove:
+                case Action.BulkCopy: {
+                    const { match, dest } = item.payload;
+                    const isMove = item.action === Action.BulkMove;
+                    const resolved = await expandPathWildcards(this.path.uri, match, true);
+                    if (resolved.length === 0) return;
+
+                    if (!await this.confirmAction(`${isMove ? 'Move' : 'Copy'} ${resolved.length} items to ${dest}?`)) return;
+
+                    const destBaseUri = this.path.append(...dest.split('/')).uri;
+                    await vscode.workspace.fs.createDirectory(destBaseUri);
+
+                    for (const r of resolved) {
+                        const newUri = Uri.joinPath(destBaseUri, OSPath.basename(r.name));
+                        try {
+                            if (isMove) {
+                                await vscode.workspace.fs.rename(r.uri, newUri, { overwrite: false });
+                            } else {
+                                await vscode.workspace.fs.copy(r.uri, newUri, { overwrite: false });
+                            }
+                        } catch (e) {
+                            console.error(`Failed to ${isMove ? 'move' : 'copy'} ${r.name}: Target might exist.`);
+                        }
+                    }
+                    this.current.value = "";
+                    await this.update();
+                    break;
+                }
+
+                case Action.NewFolder: {
+                    await vscode.workspace.fs.createDirectory(this.path.uri);
+                    await this.update();
+                    break;
+                }
+                case Action.NewFile: {
+                    // 已被 OpenFile 吸收，这里可以留空或复用
+                    break;
+                }
+                case Action.OpenFile:
+                case Action.OpenFileBeside: {
+                    const path = this.path.clone();
+                    if (item.name && item.name.length > 0) {
+                        path.push(...item.name.split('/'));
+                    }
+                    const uri = path.uri;
+
+                    try {
+                        const stat = await vscode.workspace.fs.stat(uri);
+                        if ((stat.type & FileType.Directory) === FileType.Directory) {
+                            await this.stepIntoFolder(path);
+                            return;
+                        }
+                        this.openFile(uri, item.action === Action.OpenFileBeside ? ViewColumn.Beside : ViewColumn.Active);
+                    } catch (e) {
+                        // Creating via path input
+                        const isDir = item.name.endsWith('/');
+                        if (isDir) {
+                            await vscode.workspace.fs.createDirectory(uri);
+                            this.current.value = "";
+                            await this.update();
+                        } else {
+                            // Check before creating new file over existing one (edge case)
+                            await vscode.workspace.fs.createDirectory(Uri.joinPath(uri, '..'));
+                            this.openFile(uri.with({ scheme: "untitled" }), item.action === Action.OpenFileBeside ? ViewColumn.Beside : ViewColumn.Active);
+                        }
+                    }
+                    break;
+                }
+                case Action.RenameFile: {
+                    this.keepAlive = true;
+                    this.hide();
+                    await this.rename();
+                    this.show();
+                    this.keepAlive = false;
+                    this.inActions = false;
+                    this.update();
+                    break;
+                }
+                case Action.DeleteFile: {
+                    const uri = this.path.uri;
+                    const confirmed = await this.confirmAction(
+                        `Delete ${OSPath.basename(uri.fsPath)}?`,
+                        "This will move the item to the trash.",
+                        true
+                    );
+                    if (confirmed) {
+                        await vscode.workspace.fs.delete(uri, { recursive: true, useTrash: true });
+                        this.inActions = false;
+                        await this.update();
+                    }
+                    break;
+                }
+                case Action.OpenFolder: {
+                    vscode.commands.executeCommand("vscode.openFolder", this.path.uri);
+                    break;
+                }
+                case Action.OpenFolderInNewWindow: {
+                    vscode.commands.executeCommand("vscode.openFolder", this.path.uri, true);
+                    break;
+                }
+                default:
+                    throw new Error(`Unhandled action ${item.action}`);
             }
-            case Action.OpenFolder: {
-                vscode.commands.executeCommand("vscode.openFolder", this.path.uri);
-                break;
-            }
-            case Action.OpenFolderInNewWindow: {
-                vscode.commands.executeCommand("vscode.openFolder", this.path.uri, true);
-                break;
-            }
-            default:
-                throw new Error(`Unhandled action ${item.action}`);
+        } catch (err: any) {
+            vscode.window.showErrorMessage(`Operation failed: ${err.message}`);
+            this.current.busy = false;
         }
     }
 }

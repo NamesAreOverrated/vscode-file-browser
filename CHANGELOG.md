@@ -5,6 +5,16 @@ All notable changes to the "file-browser" extension will be documented in this f
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this
 file.
 
+## [1.0.0] 
+### Added
+- Bulk operations: `r:` (rename), `d:` (delete), `c:` (copy), `m:` (move).
+- Glob pattern support for file creation and searching.
+- Symbol search with `@` and line navigation with `:`.
+- Enhanced Tab completion across all search modes.
+
+---
+Original Author's Last Version
+
 ## [0.2.11]
 
 ### FIXED

@@ -1,4 +1,3 @@
-// --- START OF FILE action.ts ---
 export enum Action {
     NewFile,
     NewFolder,
