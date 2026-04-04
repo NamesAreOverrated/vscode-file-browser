@@ -698,32 +698,43 @@ class FileBrowser {
                     const fromPattern = parts[0];
                     const toPattern = parts[1];
 
-                    label = `${isMove ? 'Move' : 'Copy'} matching items to '${toPattern}'`;
+                    // 1. 确定目标是否为目录模式
+                    const isDestDir = toPattern.endsWith('/') || toPattern.endsWith('\\');
+
+                    // 2. 分离目录和文件名部分
+                    const destDirPart = isDestDir ? toPattern : OSPath.dirname(toPattern);
+                    const destFilePart = isDestDir ? "*" : OSPath.basename(toPattern);
+
+                    // 3. 展开目标目录（如果包含通配符）
+                    let resolvedDests: { name: string, uri: Uri }[] = [];
+                    if (destDirPart.includes('*') || destDirPart.includes('?')) {
+                        resolvedDests = await expandPathWildcards(this.path.uri, destDirPart, true, true);
+                    } else {
+                        resolvedDests = [{ name: destDirPart, uri: this.path.append(...destDirPart.split('/')).uri }];
+                    }
+
+                    label = `${isMove ? 'Move' : 'Copy'} matching items to ${resolvedDests.length} location(s)`;
                     payload = { match: fromPattern, dest: toPattern };
 
+                    // 预览项生成：显示第一个目标目录的映射作为参考
                     matchedFiles = resolvedPaths.map(p => {
                         const oldBase = OSPath.basename(p.name);
-                        let newUri: Uri;
+                        const targetDir = resolvedDests[0]?.uri || this.path.uri;
 
-                        // 如果 toPattern 以 / 结尾，视为目标目录
-                        if (toPattern.endsWith('/') || toPattern.endsWith('\\')) {
-                            const destBaseUri = this.path.append(...toPattern.split('/')).uri;
-                            newUri = Uri.joinPath(destBaseUri, oldBase);
-                        } else {
-                            // 否则，尝试像 Rename 一样应用通配符替换（支持 c: *.ts *.bak）
-                            const newBase = applyWildcard(oldBase, OSPath.basename(fromPattern), OSPath.basename(toPattern)) || oldBase;
-                            // 如果 toPattern 包含路径，需要保留路径部分
-                            const destDir = OSPath.dirname(toPattern);
-                            const destBaseUri = destDir === "." ? Uri.joinPath(p.uri, '..') : this.path.append(...destDir.split('/')).uri;
-                            newUri = Uri.joinPath(destBaseUri, newBase);
+                        let newBase = oldBase;
+                        if (!isDestDir) {
+                            newBase = applyWildcard(oldBase, OSPath.basename(fromPattern), destFilePart) || oldBase;
                         }
 
+                        const newUri = Uri.joinPath(targetDir, newBase);
+                        const countSuffix = resolvedDests.length > 1 ? ` (+${resolvedDests.length - 1} dirs)` : "";
+
                         return {
-                            label: `$(arrow-right) ${p.name} -> ${vscode.workspace.asRelativePath(newUri)}`,
+                            label: `$(arrow-right) ${p.name} -> ${vscode.workspace.asRelativePath(newUri)}${countSuffix}`,
                             name: p.name,
                             alwaysShow: true,
                             action: isMove ? Action.SingleMove : Action.SingleCopy,
-                            payload: { oldUri: p.uri, newUri }
+                            payload: { oldUri: p.uri, newUri } // 单项点击依然有效
                         } as FileItem;
                     });
                 }
@@ -1156,37 +1167,47 @@ class FileBrowser {
                 case Action.BulkCopy: {
                     const { match, dest } = item.payload;
                     const isMove = item.action === Action.BulkMove;
-                    const resolved = await expandPathWildcards(this.path.uri, match, true);
-                    if (resolved.length === 0) return;
+                    const resolvedSources = await expandPathWildcards(this.path.uri, match, true);
+                    if (resolvedSources.length === 0) return;
 
-                    if (!await this.confirmAction(`${isMove ? 'Move' : 'Copy'} ${resolved.length} items?`)) return;
+                    // 1. 重新解析目标目录
+                    const isDestDir = dest.endsWith('/') || dest.endsWith('\\');
+                    const destDirPart = isDestDir ? dest : OSPath.dirname(dest);
+                    const destFilePart = isDestDir ? "*" : OSPath.basename(dest);
 
-                    for (const r of resolved) {
-                        // 这里的逻辑需要重新计算 newUri，或者直接从之前生成的预览 item 中获取（如果重新设计 payload）
-                        // 简单起见，我们根据 handleBulkOp 里的逻辑重新算一次
+                    let resolvedDests: Uri[] = [];
+                    if (destDirPart.includes('*') || destDirPart.includes('?')) {
+                        const expanded = await expandPathWildcards(this.path.uri, destDirPart, true, true);
+                        resolvedDests = expanded.map(e => e.uri);
+                    } else {
+                        resolvedDests = [this.path.append(...destDirPart.split('/')).uri];
+                    }
+
+                    if (resolvedDests.length === 0) {
+                        vscode.window.showErrorMessage("No matching destination directories found.");
+                        return;
+                    }
+
+                    if (!await this.confirmAction(`${isMove ? 'Move' : 'Copy'} ${resolvedSources.length} items to ${resolvedDests.length} folders?`)) return;
+
+                    for (const r of resolvedSources) {
                         const oldBase = OSPath.basename(r.name);
-                        let newUri: Uri;
-                        if (dest.endsWith('/') || dest.endsWith('\\')) {
-                            newUri = Uri.joinPath(this.path.append(...dest.split('/')).uri, oldBase);
-                        } else {
-                            const newBase = applyWildcard(oldBase, OSPath.basename(match), OSPath.basename(dest)) || oldBase;
-                            const destDir = OSPath.dirname(dest);
-                            const destBaseUri = destDir === "." ? Uri.joinPath(r.uri, '..') : this.path.append(...destDir.split('/')).uri;
-                            newUri = Uri.joinPath(destBaseUri, newBase);
-                        }
 
-                        try {
-                            // 关键改进：执行前确保目标目录存在
-                            await vscode.workspace.fs.createDirectory(Uri.joinPath(newUri, '..'));
+                        // 计算文件名（如果是重命名式复制 c:*.ts *.js）
+                        const newBase = isDestDir ? oldBase : (applyWildcard(oldBase, OSPath.basename(match), destFilePart) || oldBase);
 
-                            if (isMove) {
-                                await vscode.workspace.fs.rename(r.uri, newUri, { overwrite: false });
-                            } else {
-                                await vscode.workspace.fs.copy(r.uri, newUri, { overwrite: false });
+                        for (const dUri of resolvedDests) {
+                            const newUri = Uri.joinPath(dUri, newBase);
+                            try {
+                                await vscode.workspace.fs.createDirectory(Uri.joinPath(newUri, '..'));
+                                if (isMove) {
+                                    await vscode.workspace.fs.rename(r.uri, newUri, { overwrite: false });
+                                } else {
+                                    await vscode.workspace.fs.copy(r.uri, newUri, { overwrite: false });
+                                }
+                            } catch (e) {
+                                console.warn(`Failed to process ${oldBase} to ${newUri.fsPath}`);
                             }
-                        } catch (e) {
-                            // 改进：不要只在控制台打印，可以收集错误最后统一提示
-                            vscode.window.showWarningMessage(`Skipped ${oldBase}: Target already exists or access denied.`);
                         }
                     }
                     this.current.value = "";
