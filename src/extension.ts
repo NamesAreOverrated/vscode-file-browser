@@ -270,6 +270,13 @@ class FileBrowser {
             }
 
             this.lastPreviewUri = uri;
+            let targetColumn = vscode.ViewColumn.Beside;
+
+            // 如果当前已经有两栏了，我们尽量复用第一栏（大概率最大）
+            const tabGroups = vscode.window.tabGroups;
+            if (tabGroups.all.length >= 2) {
+                targetColumn = vscode.ViewColumn.One;
+            }
 
             try {
                 if (uri.scheme === 'file' || uri.scheme === 'vscode-remote') {
@@ -277,7 +284,7 @@ class FileBrowser {
                     const editor = await vscode.window.showTextDocument(uri, {
                         preview: true,
                         preserveFocus: true,
-                        viewColumn: ViewColumn.Beside
+                        viewColumn: targetColumn
                     });
 
                     if (range) {
