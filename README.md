@@ -53,7 +53,7 @@ While keeping the classic keyboard-first navigation, this version adds:
 
 **File Browser Plus** is a fork of the original `vscode-file-browser` created by **Bodil Stokke**.
 
-Copyright 2020 Bodil Stokke  
+Copyright 2020 [Bodil Stokke]
 Copyright 2026 [NamesAreOverrated]
 
 This program is free software: you can redistribute it and/or modify it under the terms of the **GNU Lesser General Public License** as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.

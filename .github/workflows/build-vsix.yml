@@ -1,0 +1,36 @@
+name: Build VSIX
+
+on:
+  push:
+    branches:
+      - main # 每次 push 到 main 分支就触发
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # 赋予创建 Release 的权限
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm install
+
+      - name: Package Extension
+        # 使用 npx 直接运行 vsce，不需要全局安装
+        # --no-dependencies 跳过一些生产环境依赖检查（可选）
+        run: npx @vscode/vsce package
+
+      - name: Upload VSIX
+        uses: actions/upload-artifact@v4
+        with:
+          name: my-extension-vsix
+          path: "*.vsix"
