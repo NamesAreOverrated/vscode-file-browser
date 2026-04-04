@@ -641,9 +641,33 @@ class FileBrowser {
         let payload: any = {};
         let matchedFiles: FileItem[] = [];
 
+        const prefix = query.match(/^[rdcm]:/)?.[0] || "";
+
         if (parts.length > 0) {
             const matchPattern = parts[0];
             const onlyDirs = matchPattern.endsWith('/');
+
+            // 特殊逻辑：如果是 r:newname (只有一个参数)
+            if (action === Action.BulkRename && parts.length === 1 && this.editorUri) {
+                const oldUri = this.editorUri;
+                const newBase = parts[0];
+                const newUri = Uri.joinPath(oldUri, '..', newBase);
+
+                label = `Rename current file to '${newBase}'`;
+                payload = { oldUri, newUri };
+                // 此时 action 应被视为 SingleRename 以便 runAction 处理
+                const item = {
+                    label: `$(edit) ${label}`,
+                    name: newBase,
+                    alwaysShow: true,
+                    action: Action.SingleRename,
+                    payload
+                } as FileItem;
+
+                this.current.items = [item];
+                this.current.busy = false;
+                return;
+            }
 
             try {
                 const resolvedPaths = await expandPathWildcards(this.path.uri, matchPattern, true, onlyDirs);
@@ -658,8 +682,6 @@ class FileBrowser {
                         const newBase = applyWildcard(oldBase, OSPath.basename(from), OSPath.basename(to)) || oldBase;
                         const dir = OSPath.dirname(p.name);
                         const displayNew = dir === "." ? newBase : `${dir}/${newBase}`;
-
-                        // 为单项重命名准备参数
                         const newUri = Uri.joinPath(Uri.joinPath(p.uri, '..'), newBase);
 
                         return {
@@ -678,32 +700,19 @@ class FileBrowser {
                         label: `$(trash) ${p.name}`,
                         name: p.name,
                         alwaysShow: true,
-                        description: "Click to delete this item only",
                         action: Action.SingleDelete,
                         payload: { uri: p.uri }
                     } as FileItem));
-                } else if (action === Action.BulkCopy && parts.length >= 2) {
-                    label = `Copy '${parts[0]}' to '${parts[1]}'`;
+                } else if ((action === Action.BulkCopy || action === Action.BulkMove) && parts.length >= 2) {
+                    const isMove = action === Action.BulkMove;
+                    label = `${isMove ? 'Move' : 'Copy'} '${parts[0]}' to '${parts[1]}'`;
                     payload = { match: parts[0], dest: parts[1] };
                     const destBaseUri = this.path.append(...parts[1].split('/')).uri;
                     matchedFiles = resolvedPaths.map(p => ({
-                        label: `$(files) ${p.name} -> ${parts[1]}/${OSPath.basename(p.name)}`,
+                        label: isMove ? `$(arrow-right) ${p.name} -> ${parts[1]}` : `$(files) ${p.name} -> ${parts[1]}`,
                         name: p.name,
                         alwaysShow: true,
-                        description: "Click to copy this item only",
-                        action: Action.SingleCopy,
-                        payload: { oldUri: p.uri, newUri: Uri.joinPath(destBaseUri, OSPath.basename(p.name)) }
-                    } as FileItem));
-                } else if (action === Action.BulkMove && parts.length >= 2) {
-                    label = `Move '${parts[0]}' to '${parts[1]}'`;
-                    payload = { match: parts[0], dest: parts[1] };
-                    const destBaseUri = this.path.append(...parts[1].split('/')).uri;
-                    matchedFiles = resolvedPaths.map(p => ({
-                        label: `$(arrow-right) ${p.name} -> ${parts[1]}/${OSPath.basename(p.name)}`,
-                        name: p.name,
-                        alwaysShow: true,
-                        description: "Click to move this item only",
-                        action: Action.SingleMove,
+                        action: isMove ? Action.SingleMove : Action.SingleCopy,
                         payload: { oldUri: p.uri, newUri: Uri.joinPath(destBaseUri, OSPath.basename(p.name)) }
                     } as FileItem));
                 }
@@ -712,6 +721,7 @@ class FileBrowser {
 
         const items: FileItem[] = [];
         if (label) {
+            // 将 Bulk Action 放在第一位
             items.push({ label: `$(zap) ${label}`, name: query, alwaysShow: true, action, payload } as FileItem);
         } else {
             items.push({ label: "Keep typing pattern...", name: "", alwaysShow: true } as FileItem);
@@ -721,6 +731,7 @@ class FileBrowser {
         this.current.items = items;
         this.current.busy = false;
     }
+
 
     // ----------------------------
 
@@ -804,24 +815,50 @@ class FileBrowser {
 
     tabCompletion(tabNext: boolean) {
         if (this.inActions) return;
-        if (this.autoCompletion) {
-            const length = this.autoCompletion.items.length;
-            const step = tabNext ? 1 : -1;
-            this.autoCompletion.index = (this.autoCompletion.index + length + step) % length;
-        } else {
-            const items = this.items.filter((i) => i.name.toLowerCase().startsWith(this.current.value.toLowerCase()));
-            this.autoCompletion = { index: tabNext ? 0 : items.length - 1, items };
-        }
-        const newIndex = this.autoCompletion.index;
-        const length = this.autoCompletion.items.length;
-        if (newIndex < length) {
-            const item = this.autoCompletion.items[newIndex];
-            this.current.value = item.name;
-            if (length === 1 && item.fileType === FileType.Directory) this.current.value += "/";
-            this.onDidChangeValue(this.current.value, true);
-        }
-    }
 
+        // 如果没有正在进行的补全序列，或者显示列表发生了变化，则重新初始化
+        if (!this.autoCompletion || this.autoCompletion.items.length !== this.current.items.length) {
+            const currentVisibleItems = this.current.items as FileItem[];
+            if (currentVisibleItems.length === 0) return;
+
+            this.autoCompletion = {
+                index: -1, // 从 -1 开始，这样第一次按 Tab 会切换到 index 0
+                items: currentVisibleItems
+            };
+        }
+
+        const { items } = this.autoCompletion;
+        const length = items.length;
+        const step = tabNext ? 1 : -1;
+
+        // 更新索引
+        this.autoCompletion.index = (this.autoCompletion.index + step + length) % length;
+        const selectedItem = items[this.autoCompletion.index];
+
+        // 智能填充：保留命令前缀 (如 r:, :, @, !, #)
+        const val = this.current.value;
+        const prefixMatch = val.match(/^([rdcm]:|[:@!#])/);
+        const prefix = prefixMatch ? prefixMatch[0] : "";
+
+        // 如果 item 有 action 且是 Bulk 操作，name 通常已经是完整 query，不作处理
+        // 否则，拼接前缀和项目名称
+        let newValue = selectedItem.name;
+        if (prefix && !newValue.startsWith(prefix)) {
+            newValue = prefix + newValue;
+        }
+
+        if (selectedItem.fileType === FileType.Directory && !newValue.endsWith('/')) {
+            newValue += "/";
+        }
+
+        this.current.value = newValue;
+
+        // 选中当前项
+        this.current.activeItems = [selectedItem];
+
+        // 触发搜索更新但标记为补全，防止重置 autoCompletion
+        this.onDidChangeValue(this.current.value, true);
+    }
     onDidAccept() {
         this.autoCompletion = undefined;
         this.activeItem().ifSome((item) => {
