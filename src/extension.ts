@@ -372,7 +372,6 @@ class FileBrowser {
                     .map(([name, type]) => {
                         const relativeName = dirPath === "" ? name : `${dirPath}/${name}`;
                         const item = new FileItem([relativeName, type]);
-                        item.action = Action.OpenFile;
                         return item;
                     });
                 displayItems.push(...matched);
@@ -605,7 +604,6 @@ class FileBrowser {
                         name: m.name,
                         description: "Existing Match",
                         alwaysShow: true,
-                        action: Action.OpenFile, // Action.OpenFile 支持步入文件夹和打开文件
                         fileType: m.type
                     } as FileItem);
                 }
@@ -646,34 +644,91 @@ class FileBrowser {
         if (parts.length > 0) {
             const matchPattern = parts[0];
             const onlyDirs = matchPattern.endsWith('/');
+            const isSingleArg = parts.length === 1;
 
-            // 特殊逻辑：如果是 r:newname (只有一个参数)
-            if (action === Action.BulkRename && parts.length === 1 && this.editorUri) {
-                const oldUri = this.editorUri;
-                const newBase = parts[0];
-                const newUri = Uri.joinPath(oldUri, '..', newBase);
+            if (isSingleArg && this.editorUri) {
+                if ((action === Action.BulkCopy || action === Action.BulkMove)) {
+                    const oldUri = this.editorUri;
+                    const newBase = parts[0];
+                    const newUri = Uri.joinPath(oldUri, '..', newBase);
 
-                label = `Rename current file to '${newBase}'`;
-                payload = { oldUri, newUri };
-                // 此时 action 应被视为 SingleRename 以便 runAction 处理
-                const item = {
-                    label: `$(edit) ${label}`,
-                    name: newBase,
-                    alwaysShow: true,
-                    action: Action.SingleRename,
-                    payload
-                } as FileItem;
+                    const isMove = action === Action.BulkMove;
+                    const item = {
+                        label: `$(files) ${isMove ? 'Move' : 'Copy'} current file to '${newBase}'`,
+                        name: newBase,
+                        alwaysShow: true,
+                        action: isMove ? Action.SingleMove : Action.SingleCopy,
+                        payload: { oldUri, newUri }
+                    } as FileItem;
 
-                this.current.items = [item];
-                this.current.busy = false;
-                return;
+                    this.current.items = [item];
+                    this.current.busy = false;
+                    return;
+                }
+
+                // 特殊逻辑：如果是 r:newname (只有一个参数)
+                else if (action === Action.BulkRename) {
+                    const oldUri = this.editorUri;
+                    const newBase = parts[0];
+                    const newUri = Uri.joinPath(oldUri, '..', newBase);
+
+                    label = `Rename current file to '${newBase}'`;
+                    payload = { oldUri, newUri };
+                    // 此时 action 应被视为 SingleRename 以便 runAction 处理
+                    const item = {
+                        label: `$(edit) ${label}`,
+                        name: newBase,
+                        alwaysShow: true,
+                        action: Action.SingleRename,
+                        payload
+                    } as FileItem;
+
+                    this.current.items = [item];
+                    this.current.busy = false;
+                    return;
+                }
             }
-
             try {
-                const resolvedPaths = await expandPathWildcards(this.path.uri, matchPattern, true, onlyDirs);
+                const resolvedPaths = await expandPathWildcards(this.path.uri, matchPattern, true);
                 if (this.searchToken !== token) return;
 
-                if (action === Action.BulkRename && parts.length >= 2) {
+                // 2. 改进 Copy/Move 的批量逻辑，支持通配符目标
+                if ((action === Action.BulkCopy || action === Action.BulkMove) && parts.length >= 2) {
+                    const isMove = action === Action.BulkMove;
+                    const fromPattern = parts[0];
+                    const toPattern = parts[1];
+
+                    label = `${isMove ? 'Move' : 'Copy'} matching items to '${toPattern}'`;
+                    payload = { match: fromPattern, dest: toPattern };
+
+                    matchedFiles = resolvedPaths.map(p => {
+                        const oldBase = OSPath.basename(p.name);
+                        let newUri: Uri;
+
+                        // 如果 toPattern 以 / 结尾，视为目标目录
+                        if (toPattern.endsWith('/') || toPattern.endsWith('\\')) {
+                            const destBaseUri = this.path.append(...toPattern.split('/')).uri;
+                            newUri = Uri.joinPath(destBaseUri, oldBase);
+                        } else {
+                            // 否则，尝试像 Rename 一样应用通配符替换（支持 c: *.ts *.bak）
+                            const newBase = applyWildcard(oldBase, OSPath.basename(fromPattern), OSPath.basename(toPattern)) || oldBase;
+                            // 如果 toPattern 包含路径，需要保留路径部分
+                            const destDir = OSPath.dirname(toPattern);
+                            const destBaseUri = destDir === "." ? Uri.joinPath(p.uri, '..') : this.path.append(...destDir.split('/')).uri;
+                            newUri = Uri.joinPath(destBaseUri, newBase);
+                        }
+
+                        return {
+                            label: `$(arrow-right) ${p.name} -> ${vscode.workspace.asRelativePath(newUri)}`,
+                            name: p.name,
+                            alwaysShow: true,
+                            action: isMove ? Action.SingleMove : Action.SingleCopy,
+                            payload: { oldUri: p.uri, newUri }
+                        } as FileItem;
+                    });
+                }
+
+                else if (action === Action.BulkRename && parts.length >= 2) {
                     const from = parts[0], to = parts[1];
                     label = `Rename matching '${from}' to '${to}'`;
                     payload = { from, to };
@@ -702,18 +757,6 @@ class FileBrowser {
                         alwaysShow: true,
                         action: Action.SingleDelete,
                         payload: { uri: p.uri }
-                    } as FileItem));
-                } else if ((action === Action.BulkCopy || action === Action.BulkMove) && parts.length >= 2) {
-                    const isMove = action === Action.BulkMove;
-                    label = `${isMove ? 'Move' : 'Copy'} '${parts[0]}' to '${parts[1]}'`;
-                    payload = { match: parts[0], dest: parts[1] };
-                    const destBaseUri = this.path.append(...parts[1].split('/')).uri;
-                    matchedFiles = resolvedPaths.map(p => ({
-                        label: isMove ? `$(arrow-right) ${p.name} -> ${parts[1]}` : `$(files) ${p.name} -> ${parts[1]}`,
-                        name: p.name,
-                        alwaysShow: true,
-                        action: isMove ? Action.SingleMove : Action.SingleCopy,
-                        payload: { oldUri: p.uri, newUri: Uri.joinPath(destBaseUri, OSPath.basename(p.name)) }
                     } as FileItem));
                 }
             } catch (e) { }
@@ -1116,21 +1159,34 @@ class FileBrowser {
                     const resolved = await expandPathWildcards(this.path.uri, match, true);
                     if (resolved.length === 0) return;
 
-                    if (!await this.confirmAction(`${isMove ? 'Move' : 'Copy'} ${resolved.length} items to ${dest}?`)) return;
-
-                    const destBaseUri = this.path.append(...dest.split('/')).uri;
-                    await vscode.workspace.fs.createDirectory(destBaseUri);
+                    if (!await this.confirmAction(`${isMove ? 'Move' : 'Copy'} ${resolved.length} items?`)) return;
 
                     for (const r of resolved) {
-                        const newUri = Uri.joinPath(destBaseUri, OSPath.basename(r.name));
+                        // 这里的逻辑需要重新计算 newUri，或者直接从之前生成的预览 item 中获取（如果重新设计 payload）
+                        // 简单起见，我们根据 handleBulkOp 里的逻辑重新算一次
+                        const oldBase = OSPath.basename(r.name);
+                        let newUri: Uri;
+                        if (dest.endsWith('/') || dest.endsWith('\\')) {
+                            newUri = Uri.joinPath(this.path.append(...dest.split('/')).uri, oldBase);
+                        } else {
+                            const newBase = applyWildcard(oldBase, OSPath.basename(match), OSPath.basename(dest)) || oldBase;
+                            const destDir = OSPath.dirname(dest);
+                            const destBaseUri = destDir === "." ? Uri.joinPath(r.uri, '..') : this.path.append(...destDir.split('/')).uri;
+                            newUri = Uri.joinPath(destBaseUri, newBase);
+                        }
+
                         try {
+                            // 关键改进：执行前确保目标目录存在
+                            await vscode.workspace.fs.createDirectory(Uri.joinPath(newUri, '..'));
+
                             if (isMove) {
                                 await vscode.workspace.fs.rename(r.uri, newUri, { overwrite: false });
                             } else {
                                 await vscode.workspace.fs.copy(r.uri, newUri, { overwrite: false });
                             }
                         } catch (e) {
-                            console.error(`Failed to ${isMove ? 'move' : 'copy'} ${r.name}: Target might exist.`);
+                            // 改进：不要只在控制台打印，可以收集错误最后统一提示
+                            vscode.window.showWarningMessage(`Skipped ${oldBase}: Target already exists or access denied.`);
                         }
                     }
                     this.current.value = "";
