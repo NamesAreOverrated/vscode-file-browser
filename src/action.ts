@@ -8,18 +8,16 @@ export enum Action {
     OpenFolder,
     OpenFolderInNewWindow,
 
-    // ======== 批量操作 Action ========
+    // ======== 批量/搜索 Action ========
     GoToSymbol,
     GoToLine,
-    OpenGlobalFile,
-    OpenGlobalFolder,
     BulkCreate,
     BulkRename,
     BulkCopy,
     BulkMove,
     BulkDelete,
 
-    // ======== 新增：单项预览的执行 Action ========
+    // ======== 单项执行 Action ========
     SingleCreate,
     SingleRename,
     SingleCopy,
