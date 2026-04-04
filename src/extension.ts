@@ -604,7 +604,8 @@ class FileBrowser {
                         name: m.name,
                         description: "Existing Match",
                         alwaysShow: true,
-                        fileType: m.type
+                        fileType: m.type,
+                        payload: m.uri
                     } as FileItem);
                 }
             }
@@ -813,9 +814,19 @@ class FileBrowser {
                 this.runAction(item);
             } else if (item.fileType !== undefined) {
                 if ((item.fileType & FileType.Directory) === FileType.Directory) {
-                    await this.stepIntoFolder(this.path.append(item.name));
+                    // 支持使用真实的绝对路径
+                    if (item.payload && item.payload.scheme) {
+                        await this.stepIntoFolder(new Path(item.payload));
+                    } else {
+                        await this.stepIntoFolder(this.path.append(item.name));
+                    }
                 } else if ((item.fileType & FileType.File) === FileType.File) {
-                    this.path.push(item.name);
+                    // 核心修复：如果是全局搜索出的文件，直接使用其真实绝对路径
+                    if (item.payload && item.payload.scheme) {
+                        this.path = new Path(item.payload);
+                    } else {
+                        this.path.push(item.name);
+                    }
                     this.file = None;
                     this.inActions = true;
                     await this.update();
@@ -855,7 +866,12 @@ class FileBrowser {
         await this.activeItem().match(
             async (item) => {
                 this.inActions = true;
-                this.path.push(item.name);
+                // 核心修复：支持真实绝对路径
+                if (item.payload && item.payload.scheme) {
+                    this.path = new Path(item.payload);
+                } else {
+                    this.path.push(item.name);
+                }
                 this.file = None;
                 await this.update();
             },
@@ -866,7 +882,6 @@ class FileBrowser {
             }
         );
     }
-
     tabCompletion(tabNext: boolean) {
         if (this.inActions) return;
 
@@ -921,7 +936,12 @@ class FileBrowser {
             } else if (item.fileType !== undefined && (item.fileType & FileType.Directory) === FileType.Directory) {
                 this.stepIn();
             } else {
-                this.openFile(this.path.append(item.name).uri);
+                // 核心修复：支持真实绝对路径的打开
+                if (item.payload && item.payload.scheme) {
+                    this.openFile(item.payload);
+                } else {
+                    this.openFile(this.path.append(item.name).uri);
+                }
             }
         });
     }
