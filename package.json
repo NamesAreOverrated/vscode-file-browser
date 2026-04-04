@@ -3,7 +3,7 @@
     "publisher": "NamesAreOverrated",
     "displayName": "File Browser",
     "description": "A nicer alternative to the file open dialog.",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "license": "LGPL-3.0+",
     "author": {
         "name": "NamesAreOverrated"
@@ -18,7 +18,7 @@
     ],
     "icon": "images/icon.png",
     "engines": {
-        "vscode": "^1.75.1"
+        "vscode": "^1.110.0"
     },
     "categories": [
         "Other"
@@ -129,7 +129,7 @@
         "@types/glob": "^8.1.0",
         "@types/mocha": "^10.0.8",
         "@types/node": "^22.19.17",
-        "@types/vscode": "1.75.1",
+        "@types/vscode": "^1.110.0",
         "@typescript-eslint/eslint-plugin": "^8.8.0",
         "@typescript-eslint/parser": "^8.8.0",
         "@vscode/test-electron": "^2.4.1",

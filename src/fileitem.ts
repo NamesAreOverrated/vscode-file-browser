@@ -38,7 +38,7 @@ export function itemIsDir(item: FileItem): boolean {
     if (item.fileType === undefined) {
         return false;
     }
-    return !!(item.fileType | FileType.Directory);
+    return !!(item.fileType & FileType.Directory);
 }
 
 export function fileRecordCompare(left: [string, FileType], right: [string, FileType]): -1 | 0 | 1 {

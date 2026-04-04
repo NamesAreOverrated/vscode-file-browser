@@ -5,7 +5,16 @@ All notable changes to the "file-browser" extension will be documented in this f
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this
 file.
 
+## [1.1.0] 
+
+### ADDED
+-   Added preview function to view the tab currently being search.
+
+### CHANGED
+-   Refactor stepIn/stepOut to use a stack like trace. Return to previous search and actions with ease.
+
 ## [1.0.0] 
+
 ### Added
 - Bulk operations: `r:` (rename), `d:` (delete), `c:` (copy), `m:` (move).
 - Glob pattern support for file creation and searching.

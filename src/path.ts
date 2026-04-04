@@ -91,12 +91,12 @@ export class Path {
      * @returns [[None]] if the path has no more segments to pop.
      */
     pop(): Option<string> {
-        if (this.atTop()) {
-            return None;
-        }
-        const current = new Path(this.pathUri);
-        this.pathUri = Uri.joinPath(this.pathUri, "..");
-        return current.relativeTo(this.pathUri);
+        if (this.atTop()) return None;
+        const oldPath = this.pathUri.fsPath;
+        const parentPath = OSPath.dirname(oldPath);
+        const poppedSegment = OSPath.basename(oldPath);
+        this.pathUri = Uri.file(parentPath);
+        return Some(poppedSegment);
     }
 
     getWorkspaceFolder(): Option<WorkspaceFolder> {
@@ -118,7 +118,7 @@ export class Path {
     async isDir(): Promise<boolean> {
         const stat = await this.stat();
         return stat.match(
-            (stat) => !!(stat.type | FileType.Directory),
+            (stat) => !!(stat.type & FileType.Directory),
             () => false
         );
     }
