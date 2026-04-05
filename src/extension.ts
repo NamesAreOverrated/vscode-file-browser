@@ -248,9 +248,9 @@ class FileBrowser {
     // ================= Preview =================
     private previewTimeout?: NodeJS.Timeout;
     private lastPreviewUri?: Uri;
+    private urisToClose = new Set<string>();
     private async preview(item: FileItem) {
         if (this.inActions) return;
-
         // 核心修复：一旦选中项改变或清空（例如删至1个字符变占位符），必须立刻扼杀之前在后台排队的拉起文件定时器。
         // 否则如果在150ms倒计时中用户快速退格变成了占位符，之前的文件依然会在后台拉起，并抢走焦点强制关闭QuickPick！
         if (this.previewTimeout) {
@@ -305,14 +305,11 @@ class FileBrowser {
                 return;
             }
 
-            this.lastPreviewUri = uri;
-            let targetColumn = vscode.ViewColumn.Beside;
-
-            // 如果当前已经有两栏了，我们尽量复用第一栏（大概率最大）
-            const tabGroups = vscode.window.tabGroups;
-            if (tabGroups.all.length > 2) {
-                targetColumn = vscode.ViewColumn.One;
+            if (this.lastPreviewUri != uri) {
+                this.lastPreviewUri = uri;
+                this.urisToClose.add(uri.toString());
             }
+            let targetColumn = vscode.window.tabGroups.activeTabGroup.viewColumn == vscode.ViewColumn.One ? vscode.ViewColumn.Two : vscode.ViewColumn.One;
 
             try {
                 const editor = await vscode.window.showTextDocument(uri, {
@@ -342,27 +339,22 @@ class FileBrowser {
     }
 
     private closePreviewTab() {
-        if (!this.lastPreviewUri) return;
-        const uriString = this.lastPreviewUri.toString();
-        this.lastPreviewUri = undefined; // 立即清除，防止短时间内重复触发
+        if (this.urisToClose.size === 0) return;
 
-
-        let tabToClose: vscode.Tab | undefined;
         for (const group of vscode.window.tabGroups.all) {
             for (const tab of group.tabs) {
-                // 严格判断 tab.isPreview，绝对不碰用户开好的实体标签页
-                if (tab.input instanceof vscode.TabInputText &&
-                    tab.input.uri.toString() === uriString &&
-                    tab.isPreview) {
-                    tabToClose = tab;
-                    break;
+                if (tab.input instanceof vscode.TabInputText) {
+                    const uriStr = tab.input.uri.toString();
+                    if (this.urisToClose.has(uriStr)) {
+                        // 绝对只关闭 isPreview 的标签页，绝不碰用户正常打开的同名文件
+                        if (tab.isPreview) {
+                            vscode.window.tabGroups.close(tab, true);
+                        }
+                        // 处理过就从黑名单移除
+                        this.urisToClose.delete(uriStr);
+                    }
                 }
             }
-            if (tabToClose) break;
-        }
-
-        if (tabToClose) {
-            vscode.window.tabGroups.close(tabToClose, true);
         }
     }
     // 辅助方法：清除所有高亮
@@ -414,8 +406,8 @@ class FileBrowser {
     // ================= UI 生命周期与事件 =================
 
     dispose() {
-        console.log("dispose");
         this.closePreviewTab();
+        this.clearDecorations();
         setContext(false);
         this.current.dispose();
         active = None;
