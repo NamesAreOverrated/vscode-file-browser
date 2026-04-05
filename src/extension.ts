@@ -10,7 +10,15 @@ import { FileItem, fileRecordCompare, itemIsDir } from "./fileitem";
 import { action, Action } from "./action";
 
 // ================= 工具函数 =================
-
+// 将普通字符串转为不区分大小写的 Glob 字符串 (例如 "abc" -> "[aA][bB][cC]")
+function toCaseInsensitiveGlob(str: string): string {
+    return str.split('').map(c => {
+        if (/[a-zA-Z]/.test(c)) {
+            return `[${c.toLowerCase()}${c.toUpperCase()}]`;
+        }
+        return c;
+    }).join('');
+}
 // 文本搜索的高亮：使用原生的“查找匹配”颜色
 const searchDecorationType = vscode.window.createTextEditorDecorationType({
     backgroundColor: new vscode.ThemeColor('editor.findMatchHighlightBackground'),
@@ -243,6 +251,20 @@ class FileBrowser {
     private async preview(item: FileItem) {
         if (this.inActions) return;
 
+        // 核心修复：一旦选中项改变或清空（例如删至1个字符变占位符），必须立刻扼杀之前在后台排队的拉起文件定时器。
+        // 否则如果在150ms倒计时中用户快速退格变成了占位符，之前的文件依然会在后台拉起，并抢走焦点强制关闭QuickPick！
+        if (this.previewTimeout) {
+            clearTimeout(this.previewTimeout);
+            this.previewTimeout = undefined;
+        }
+
+        // 【修复 2.1】：如果当前焦点在 "Type to search..." 等占位符上，绝不能触发预览逻辑
+        if (!item || item.name === "") {
+            this.closePreviewTab();
+            this.clearDecorations();
+            return;
+        }
+
         const canPreview = item.action === undefined ||
             item.action === Action.GoToLine ||
             item.action === Action.OpenFile;
@@ -252,8 +274,6 @@ class FileBrowser {
             this.clearDecorations();
             return;
         }
-
-        if (this.previewTimeout) clearTimeout(this.previewTimeout);
 
         this.previewTimeout = setTimeout(async () => {
             let uri: Uri | undefined;
@@ -271,8 +291,17 @@ class FileBrowser {
                 uri = this.path.append(item.name).uri;
             }
 
-
             if (!uri) {
+                return;
+            }
+
+            // 【修复 2.2】：在展示之前再加一层防线。调用 showTextDocument 试图打开目录会直接抛错，导致整个 UI 崩溃退出。
+            try {
+                const stat = await vscode.workspace.fs.stat(uri);
+                if (stat.type & FileType.Directory) {
+                    return;
+                }
+            } catch (e) {
                 return;
             }
 
@@ -281,7 +310,7 @@ class FileBrowser {
 
             // 如果当前已经有两栏了，我们尽量复用第一栏（大概率最大）
             const tabGroups = vscode.window.tabGroups;
-            if (tabGroups.all.length >= 2) {
+            if (tabGroups.all.length > 2) {
                 targetColumn = vscode.ViewColumn.One;
             }
 
@@ -292,7 +321,6 @@ class FileBrowser {
                     viewColumn: targetColumn
                 });
 
-
                 if (range && !editor.selection.active.isEqual(range.start)) {
                     this.clearDecorations();
                     // 1. 设置光标位置（Selection）
@@ -301,10 +329,8 @@ class FileBrowser {
 
                     // 2. 应用装饰器高亮（Decoration）
                     if (item.action === Action.GoToLine) {
-                        // 符号跳转：高亮整个区域（或整行）
                         editor.setDecorations(rangeDecorationType, [range]);
                     } else {
-                        // 文本搜索：只高亮匹配的词
                         editor.setDecorations(searchDecorationType, [range]);
                     }
 
@@ -315,28 +341,41 @@ class FileBrowser {
         }, 150);
     }
 
-    // 辅助方法：清除所有高亮
-    private clearDecorations() {
-        vscode.window.visibleTextEditors.forEach(editor => {
-            editor.setDecorations(searchDecorationType, []);
-            editor.setDecorations(rangeDecorationType, []);
-        });
-    }
-
     private closePreviewTab() {
         if (!this.lastPreviewUri) return;
         const uriString = this.lastPreviewUri.toString();
+        this.lastPreviewUri = undefined; // 立即清除，防止短时间内重复触发
+
+        let tabToClose: vscode.Tab | undefined;
         for (const group of vscode.window.tabGroups.all) {
             for (const tab of group.tabs) {
                 // 严格判断 tab.isPreview，绝对不碰用户开好的实体标签页
                 if (tab.input instanceof vscode.TabInputText &&
                     tab.input.uri.toString() === uriString &&
                     tab.isPreview) {
-                    vscode.window.tabGroups.close(tab);
+                    tabToClose = tab;
+                    break;
                 }
             }
+            if (tabToClose) break;
         }
-        this.lastPreviewUri = undefined;
+
+        if (tabToClose) {
+            vscode.window.tabGroups.close(tabToClose);
+            // 【修复 2.3】：关闭旧的预览 Tab 会发生不可见的底层焦点切换。
+            // this.current.ignoreFocusOut = true;
+            /* vscode.window.tabGroups.close(tabToClose).then(() => {
+                // 延长一点等待时间，确保底层 Tab 彻底销毁后再恢复
+                setTimeout(() => { this.current.ignoreFocusOut = false; }, 200);
+            }); */
+        }
+    }
+    // 辅助方法：清除所有高亮
+    private clearDecorations() {
+        vscode.window.visibleTextEditors.forEach(editor => {
+            editor.setDecorations(searchDecorationType, []);
+            editor.setDecorations(rangeDecorationType, []);
+        });
     }
 
 
@@ -527,11 +566,16 @@ class FileBrowser {
         if (this.isRestoringState || this.inActions) return;
         if (!isAutoComplete) this.autoCompletion = undefined;
 
+        // 【关键修复 1】：只要内容变化，立刻增加 token，强制掐断所有还在后台等待的异步搜索
+        ++this.searchToken;
+
         if (this.searchTimeout) {
             clearTimeout(this.searchTimeout);
             this.searchTimeout = undefined;
         }
+
         if (value === "") {
+            this.current.busy = false;
             this.current.items = this.items;
             this.current.activeItems = [];
             return;
@@ -577,6 +621,7 @@ class FileBrowser {
 
         this.current.items = displayItems;
         if (displayItems.length > 0) this.current.activeItems = [displayItems[0]];
+        this.current.busy = false; // 结束同步搜索的加载状态
     }
 
     private debounce(func: () => void | Promise<void>, delay: number = 250) {
@@ -851,17 +896,18 @@ class FileBrowser {
             label: `$(go-to-file) Go to line ${line}`, name: query, alwaysShow: true, fileType: FileType.File, payload: { uri: this.editorUri, range }
         } as FileItem];
     }
-
     async handleGlobalFileSearch(query: string) {
+        const token = ++this.searchToken;
         query = query.trim();
         if (query.length < 2) {
             this.current.items = [{ label: "Type at least 2 chars to search...", name: "", alwaysShow: true } as FileItem];
             return;
         }
-        const token = ++this.searchToken;
         this.current.busy = true;
         try {
-            const files = await vscode.workspace.findFiles(`**/*${query}*`, '**/node_modules/**', 50);
+            // 使用新工具函数，使得文件搜索不再区分大小写
+            const globPattern = toCaseInsensitiveGlob(query);
+            const files = await vscode.workspace.findFiles(`**/*${globPattern}*`, '**/node_modules/**', 50);
             if (this.searchToken !== token) return;
             this.current.items = files.map(uri => ({
                 label: `$(file) ${OSPath.basename(uri.fsPath)}`, description: vscode.workspace.asRelativePath(uri),
@@ -873,15 +919,17 @@ class FileBrowser {
     }
 
     async handleGlobalFolderSearch(query: string) {
+        const token = ++this.searchToken;
         query = query.trim();
         if (query.length < 1) {
             this.current.items = [{ label: "Type to search folders globally...", name: "", alwaysShow: true } as FileItem];
             return;
         }
-        const token = ++this.searchToken;
         this.current.busy = true;
         try {
-            const files = await vscode.workspace.findFiles(`**/*${query}*/**`, '**/node_modules/**', 200);
+            // 使用新工具函数，使得文件夹搜索不再区分大小写
+            const globPattern = toCaseInsensitiveGlob(query);
+            const files = await vscode.workspace.findFiles(`**/*${globPattern}*/**`, '**/node_modules/**', 200);
             if (this.searchToken !== token) return;
 
             const dirSet = new Set<string>();
@@ -1117,14 +1165,6 @@ class FileBrowser {
                     const targetSelection = selectionRange || range;
                     editor.selection = new vscode.Selection(targetSelection.start, targetSelection.end);
                     editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
-
-                    /* 
-                                        setTimeout(() => {
-                                            if (editor.document === doc) {
-                                                editor.selection = new vscode.Selection(targetSelection.start, targetSelection.end);
-                                                editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
-                                            }
-                                        }, 50); */
                 }
             });
         });
