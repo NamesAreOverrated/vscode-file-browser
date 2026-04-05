@@ -346,6 +346,7 @@ class FileBrowser {
         const uriString = this.lastPreviewUri.toString();
         this.lastPreviewUri = undefined; // 立即清除，防止短时间内重复触发
 
+
         let tabToClose: vscode.Tab | undefined;
         for (const group of vscode.window.tabGroups.all) {
             for (const tab of group.tabs) {
@@ -361,13 +362,7 @@ class FileBrowser {
         }
 
         if (tabToClose) {
-            vscode.window.tabGroups.close(tabToClose);
-            // 【修复 2.3】：关闭旧的预览 Tab 会发生不可见的底层焦点切换。
-            // this.current.ignoreFocusOut = true;
-            /* vscode.window.tabGroups.close(tabToClose).then(() => {
-                // 延长一点等待时间，确保底层 Tab 彻底销毁后再恢复
-                setTimeout(() => { this.current.ignoreFocusOut = false; }, 200);
-            }); */
+            vscode.window.tabGroups.close(tabToClose, true);
         }
     }
     // 辅助方法：清除所有高亮
@@ -419,6 +414,7 @@ class FileBrowser {
     // ================= UI 生命周期与事件 =================
 
     dispose() {
+        console.log("dispose");
         this.closePreviewTab();
         setContext(false);
         this.current.dispose();
