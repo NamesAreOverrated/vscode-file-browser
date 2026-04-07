@@ -1394,117 +1394,110 @@ class FileBrowser {
     }
 
 
-    // 重构的 Tab 自动补全机制：像终端一样智能补全（Partial match / LCP）
     tabCompletion() {
         if (this.inActions) return;
 
         const val = this.current.value;
 
-        // 1. 在特殊的非路径查找模式中，禁用补全
-        if (val.match(/^(\$\$|\$|%%|%|@@|@|!|#|:)/)) {
+        // 1. 禁用特殊模式下的补全
+        if (val.match(/^(\$$|\$|%%|%|@@|@|!|#|:)/)) {
             return;
         }
 
-        // 2. 找到当前正在输入的最后一个词 (以空格分隔的最后一部分，支持多参数如 r:*.js *.t)
+        // 2. 提取当前正在输入的最后一个 Token (支持多参数)
         const tokenMatch = val.match(/(\S+)$/);
-        if (!tokenMatch) return; // 输入以空格结尾或为空
+        if (!tokenMatch) return;
         const token = tokenMatch[1];
-        const tokenPrefix = val.substring(0, val.length - token.length);
 
-        // 3. 提取可能的命令前缀 (e.g. d:, r:, c:, m:)
+        // 3. 提取命令前缀 (如 d:, r:) 并找到搜索部分
         const prefixMatch = token.match(/^([rdcm]:)/);
         const cmdPrefix = prefixMatch ? prefixMatch[0] : "";
         const restToken = token.substring(cmdPrefix.length);
 
-        // 4. 将剩余路径拆分为目录部分和搜索部分
+        // 4. 分离路径和搜索词
         const lastSlashIdx = restToken.lastIndexOf('/');
         const searchPart = restToken.substring(lastSlashIdx + 1);
 
-        // 5. 如果 searchPart 以 * 或 ? 结尾，此时不适合做普通的后缀补全
+        // 如果以通配符结尾，不执行普通后缀补全
         if (/[*?]$/.test(searchPart)) return;
 
-        // 提取末尾实际输入的字面字符（忽略前面如 * 的 glob 字符）
-        // 比如 `*_storag` -> 提取出 `storag`
+        // 提取搜索词末尾的字面量 (用于锚定补全位置)
+        // 例如 `*_stora` -> `stora`
         const typedTextMatch = searchPart.match(/[^*?]+$/);
         const typedText = typedTextMatch ? typedTextMatch[0] : "";
         const typedLower = typedText.toLowerCase();
 
-        // 6. 过滤有效文件项并提取候选后缀
-        // 排除掉没有 fileType 的纯文本装饰项 (如 Create, Info 等)
+        // 5. 过滤出有效的文件项
         const validItems = this.current.items.filter(item =>
             item.fileType !== undefined && item.name
         );
-
         if (validItems.length === 0) return;
 
-        const suffixes: { text: string, isDir: boolean }[] = [];
+        const candidates: { text: string, isDir: boolean }[] = [];
 
         for (const item of validItems) {
-            // 仅使用 basename 来补全当前层级，打破 bulk op 中深层路径的干扰
             const basename = OSPath.basename(item.name);
-            // 找到用户输入字符在文件名中的位置
-            const idx = typedLower === "" ? 0 : basename.toLowerCase().lastIndexOf(typedLower);
+            // 使用 indexOf 解决 "iiiiii" 匹配到末尾 "ii" 的问题
+            const idx = typedLower === "" ? 0 : basename.toLowerCase().indexOf(typedLower);
+
             if (idx !== -1) {
-                suffixes.push({
+                candidates.push({
+                    // text 是从匹配点开始直到文件末尾的完整部分
                     text: basename.substring(idx),
                     isDir: !!(item.fileType !== undefined && item.fileType & FileType.Directory)
                 });
             }
         }
 
-        if (suffixes.length === 0) return;
+        if (candidates.length === 0) return;
 
-        // 7. 计算候选后缀的最长公共前缀 (LCP, Longest Common Prefix)
-        // 支持大小写不敏感匹配，并在大小写产生分歧时保留用户的输入习惯
+        // 6. 计算 LCP (最长公共前缀)，同时修复大小写
         let lcp = "";
         let j = 0;
         while (true) {
-            if (j >= suffixes[0].text.length) break;
-            const charLower = suffixes[0].text[j].toLowerCase();
-            const charStrict = suffixes[0].text[j];
+            if (j >= candidates[0].text.length) break;
+
+            const charStrict = candidates[0].text[j]; // 实际文件的字符
+            const charLower = charStrict.toLowerCase();
             let allMatchLower = true;
             let allMatchStrict = true;
 
-            for (let i = 1; i < suffixes.length; i++) {
-                if (j >= suffixes[i].text.length) {
+            for (let i = 1; i < candidates.length; i++) {
+                if (j >= candidates[i].text.length) {
                     allMatchLower = false;
                     break;
                 }
-                if (suffixes[i].text[j].toLowerCase() !== charLower) {
+                const compareChar = candidates[i].text[j];
+                if (compareChar.toLowerCase() !== charLower) {
                     allMatchLower = false;
                     break;
                 }
-                if (suffixes[i].text[j] !== charStrict) {
+                if (compareChar !== charStrict) {
                     allMatchStrict = false;
                 }
             }
 
-            if (!allMatchLower) break; // 如果连忽略大小写都无法匹配，中止
+            if (!allMatchLower) break;
 
-            if (allMatchStrict) {
-                // 大小写完美一致，直接采用系统文件的真实字符
-                lcp += charStrict;
-            } else {
-                // 出现大小写分歧：如果属于用户敲击的范围，保留用户的习惯；否则退化为小写或文件本来字符
-                if (j < typedText.length) {
-                    lcp += typedText[j];
-                } else {
-                    lcp += charLower;
-                }
-            }
+            // 遵循实际文件的大小写：
+            // 如果所有匹配项该位置字符相同，用该字符。
+            // 如果大小写有分歧但字符相同，默认取第一个候选者的字符（遵循实际文件）
+            lcp += allMatchStrict ? charStrict : charStrict;
             j++;
         }
 
-        // 8. 构建新的补全后缀
+        // 7. 补全文件夹的 / 逻辑
         let newSuffix = lcp;
-        // 如果只有一个候选匹配，且它是目录，在末尾追加 `/` 方便下钻
-        if (suffixes.length === 1 && suffixes[0].text === lcp && suffixes[0].isDir) {
-            newSuffix += '/';
+        if (candidates.length === 1) {
+            // 只有当 LCP 完全等于候选者的剩余全名时，才说明名字打完了，此时才加 /
+            if (candidates[0].text === lcp && candidates[0].isDir) {
+                newSuffix += '/';
+            }
         }
 
-        // 9. 拼装最新的输入框文本
-        // tokenPrefix: 前面按空格分割留下的参数 (e.g. `r:*.js `)
-        // val.substring(...) - tokenPrefix: 定位到最后被操作的字串，并截掉原本的 typedText，替换为 LCP
+        // 8. 替换文本
+        // 将原本的 typedText 替换为补全后的 newSuffix
+        // 这保证了 `*_stora` 前面的 `*_` 被保留
         const newValue = val.substring(0, val.length - typedText.length) + newSuffix;
 
         if (this.current.value !== newValue) {
