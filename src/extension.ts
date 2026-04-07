@@ -251,14 +251,11 @@ class FileBrowser {
     private urisToClose = new Set<string>();
     private async preview(item: FileItem) {
         if (this.inActions) return;
-        // 核心修复：一旦选中项改变或清空（例如删至1个字符变占位符），必须立刻扼杀之前在后台排队的拉起文件定时器。
-        // 否则如果在150ms倒计时中用户快速退格变成了占位符，之前的文件依然会在后台拉起，并抢走焦点强制关闭QuickPick！
         if (this.previewTimeout) {
             clearTimeout(this.previewTimeout);
             this.previewTimeout = undefined;
         }
 
-        // 【修复 2.1】：如果当前焦点在 "Type to search..." 等占位符上，绝不能触发预览逻辑
         if (!item || item.name === "") {
             this.closePreviewTab();
             this.clearDecorations();
@@ -305,10 +302,9 @@ class FileBrowser {
                 return;
             }
 
-            if (this.lastPreviewUri != uri) {
-                this.lastPreviewUri = uri;
-                this.urisToClose.add(uri.toString());
-            }
+            this.lastPreviewUri = uri;
+            this.urisToClose.add(uri.toString());
+
             let targetColumn = vscode.window.tabGroups.activeTabGroup.viewColumn == vscode.ViewColumn.One ? vscode.ViewColumn.Two : vscode.ViewColumn.One;
 
             try {
