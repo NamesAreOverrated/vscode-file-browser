@@ -124,331 +124,155 @@ function expandBraces(str: string): string[] {
     }
     return results;
 }
-
-export interface ExpandedPath {
-    name: string;        // 相对 baseUri 的路径名
-    uri: vscode.Uri;
+type ExpandedPath = {
+    name: string;
+    uri: Uri;
     exists: boolean;
-    type?: vscode.FileType;
-    isDir: boolean;      // 根据模式后缀 (/) 或 实际文件系统状态判断
-}
-
-/**
- * 统一的路径展开函数
- * @param baseUri 基准路径
- * @param pattern 模式 (支持 {}, *, **, .., .)
- * @param fuzzy   是否开启模糊搜索 (用于 searchExistingPaths)
- */
-export async function expandPathPattern(
-    baseUri: vscode.Uri,
+    type?: FileType;
+    isDir: boolean;
+};
+export async function expandPaths(
+    baseUri: Uri,
     pattern: string,
-    fuzzy: boolean = false
+    opts?: {
+        onlyExisting?: boolean;
+        onlyDirs?: boolean;
+        fuzzy?: boolean;
+        maxDepth?: number;
+    }
 ): Promise<ExpandedPath[]> {
-    const patterns = expandBraces(pattern.replace(/\\/g, '/'));
-    const allResults: ExpandedPath[] = [];
-    const seenUris = new Set<string>();
+    const {
+        onlyExisting = false,
+        onlyDirs = false,
+        fuzzy = false,
+        maxDepth = 8
+    } = opts || {};
 
-    for (const p of patterns) {
-        const isPatternDir = p.endsWith('/');
-        const segments = p.split('/').filter(s => s.length > 0 && s !== '.');
-        let current = [{ rel: "", uri: baseUri }];
+    const isDirHint = pattern.endsWith('/') || pattern.endsWith('\\');
+    pattern = pattern.replace(/\\/g, '/');
 
-        // 处理段
+    // 1️⃣ brace 展开
+    const patterns = expandBraces(pattern);
+    const results: ExpandedPath[] = [];
+    const seen = new Set<string>();
+
+    for (const pat of patterns) {
+        const clean = pat.endsWith('/') ? pat.slice(0, -1) : pat;
+        const segments = clean.split('/').filter(Boolean);
+
+        // 状态中增加 isDir 标记，初始假定 baseUri 是目录
+        let current: { name: string, uri: Uri, isDir: boolean }[] = [{ name: "", uri: baseUri, isDir: true }];
+
+        // 逐级解析路径段
         for (let i = 0; i < segments.length; i++) {
             const seg = segments[i];
-            const isLast = i === segments.length - 1;
-            const nextBatch: { rel: string, uri: vscode.Uri }[] = [];
+            const next: typeof current = [];
 
             for (const cur of current) {
+                // 如果当前项不是目录，无法进行下一级解析，直接跳过
+                if (!cur.isDir) continue;
+
+                // ../
                 if (seg === '..') {
-                    const nextUri = vscode.Uri.joinPath(cur.uri, '..');
-                    nextBatch.push({ rel: cur.rel ? OSPath.join(cur.rel, '..') : '..', uri: nextUri });
-                } else if (seg === '**') {
-                    // 递归搜索逻辑
-                    const walk = async (u: vscode.Uri, r: string, depth: number) => {
-                        if (depth > 5) return; // 防止过深
-                        nextBatch.push({ rel: r, uri: u });
+                    const parentUri = Uri.joinPath(cur.uri, '..');
+                    next.push({
+                        name: cur.name ? `${cur.name}/..` : '..',
+                        uri: parentUri,
+                        isDir: true // 父级必然是目录
+                    });
+                    continue;
+                }
+
+                // ** (递归搜索)
+                if (seg === '**') {
+                    const walk = async (u: Uri, rel: string, depth: number) => {
+                        if (depth > maxDepth) return;
+                        next.push({ name: rel, uri: u, isDir: true });
+
                         try {
                             const entries = await vscode.workspace.fs.readDirectory(u);
                             for (const [n, t] of entries) {
-                                if (t & vscode.FileType.Directory)
-                                    await walk(vscode.Uri.joinPath(u, n), r ? `${r}/${n}` : n, depth + 1);
+                                if (t & FileType.Directory) {
+                                    await walk(
+                                        Uri.joinPath(u, n),
+                                        rel ? `${rel}/${n}` : n,
+                                        depth + 1
+                                    );
+                                }
                             }
                         } catch { }
                     };
-                    await walk(cur.uri, cur.rel, 0);
-                } else {
-                    // 通配符或普通段
+
+                    await walk(cur.uri, cur.name, 0);
+                    continue;
+                }
+
+                // 通配符匹配 (* 或 ?) 或 模糊搜索
+                if (seg.includes('*') || seg.includes('?') || fuzzy) {
                     try {
                         const entries = await vscode.workspace.fs.readDirectory(cur.uri);
-                        const regexStr = fuzzy
-                            ? `.*${seg.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.')}.*`
-                            : `^${seg.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.')}$`;
-                        const regex = new RegExp(regexStr, 'i');
-
                         for (const [n, t] of entries) {
+                            const isDir = !!(t & FileType.Directory);
+                            const patternStr = seg.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.');
+                            const regex = fuzzy ? new RegExp(`.*${patternStr}.*`, 'i') : new RegExp(`^${patternStr}$`);
+
                             if (regex.test(n)) {
-                                if (!isLast && !(t & vscode.FileType.Directory)) continue;
-                                nextBatch.push({ rel: cur.rel ? `${cur.rel}/${n}` : n, uri: vscode.Uri.joinPath(cur.uri, n) });
+                                next.push({
+                                    name: cur.name ? `${cur.name}/${n}` : n,
+                                    uri: Uri.joinPath(cur.uri, n),
+                                    isDir: isDir
+                                });
+                            }
+
+                            // 如果是模糊模式且是目录，则递归寻找更多匹配
+                            if (fuzzy && isDir) {
+                                const subWalk = async (u: Uri, rel: string, depth: number) => {
+                                    if (depth > maxDepth) return;
+                                    try {
+                                        const subEntries = await vscode.workspace.fs.readDirectory(u);
+                                        for (const [sn, st] of subEntries) {
+                                            const sIsDir = !!(st & FileType.Directory);
+                                            if (regex.test(sn)) {
+                                                next.push({ name: `${rel}/${sn}`, uri: Uri.joinPath(u, sn), isDir: sIsDir });
+                                            }
+                                            if (sIsDir) await subWalk(Uri.joinPath(u, sn), `${rel}/${sn}`, depth + 1);
+                                        }
+                                    } catch { }
+                                };
+                                await subWalk(Uri.joinPath(cur.uri, n), cur.name ? `${cur.name}/${n}` : n, 1);
                             }
                         }
-                    } catch {
-                        // 路径不存在时，如果不是模糊匹配且不含通配符，则硬编码加入（为了支持 Creation）
-                        if (!fuzzy && !seg.includes('*') && !seg.includes('?')) {
-                            nextBatch.push({
-                                rel: cur.rel ? `${cur.rel}/${seg}` : seg,
-                                uri: vscode.Uri.joinPath(cur.uri, seg)
-                            });
-                        }
-                    }
-                }
-            }
-            current = nextBatch;
-        }
-
-        // 最终状态检查
-        for (const item of current) {
-            const uriStr = item.uri.toString();
-            if (seenUris.has(uriStr)) continue;
-            seenUris.add(uriStr);
-
-            let type: vscode.FileType | undefined;
-            let exists = false;
-            try {
-                const stat = await vscode.workspace.fs.stat(item.uri);
-                exists = true;
-                type = stat.type;
-            } catch { }
-
-            allResults.push({
-                name: item.rel || ".",
-                uri: item.uri,
-                exists,
-                type,
-                isDir: exists ? !!(type! & vscode.FileType.Directory) : isPatternDir
-            });
-        }
-    }
-    return allResults;
-}
-
-export async function resolveExistingPaths(baseUri: Uri, pattern: string, onlyDirs: boolean = false): Promise<{ name: string, uri: Uri, type: FileType }[]> {
-    pattern = pattern.replace(/\\/g, '/');
-    let currentPaths = [{ name: "", uri: baseUri }];
-    const segments = pattern.split('/').filter(s => s.length > 0);
-
-    if (segments.length === 0 && (pattern === '.' || pattern === './')) {
-        // Handle current dir
-    } else if (segments.length === 0) {
-        return [];
-    }
-
-    for (let i = 0; i < segments.length; i++) {
-        const seg = segments[i];
-        if (seg === '.') continue;
-
-        const isLastSegment = i === segments.length - 1;
-        const nextPathsMap = new Map<string, { name: string, uri: Uri }>();
-
-        for (const cur of currentPaths) {
-            if (seg === '..') {
-                const nextUri = Uri.joinPath(cur.uri, '..');
-                const nameParts = cur.name.split('/').filter(s => s.length > 0);
-                if (nameParts.length > 0 && nameParts[nameParts.length - 1] !== '..') nameParts.pop();
-                else nameParts.push('..');
-                nextPathsMap.set(nextUri.toString(), { name: nameParts.join('/'), uri: nextUri });
-            } else if (seg === '**') {
-                async function walk(u: Uri, relName: string, depth: number) {
-                    if (depth > 8) return;
-                    const key = u.toString();
-                    if (!nextPathsMap.has(key)) nextPathsMap.set(key, { name: relName, uri: u });
-                    try {
-                        const entries = await vscode.workspace.fs.readDirectory(u);
-                        for (const [n, t] of entries) {
-                            if (t & FileType.Directory) await walk(Uri.joinPath(u, n), relName ? `${relName}/${n}` : n, depth + 1);
-                        }
                     } catch { }
+                    continue;
                 }
-                await walk(cur.uri, cur.name, 0);
-            } else if (seg.includes('*') || seg.includes('?')) {
-                try {
-                    const entries = await vscode.workspace.fs.readDirectory(cur.uri);
-                    const regexStr = '^' + seg.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$';
-                    const regex = new RegExp(regexStr);
 
-                    for (const [n, t] of entries) {
-                        if (regex.test(n)) {
-                            const isDir = !!(t & FileType.Directory);
-                            if (!isLastSegment && !isDir) continue;
-                            const nextUri = Uri.joinPath(cur.uri, n);
-                            nextPathsMap.set(nextUri.toString(), { name: cur.name ? `${cur.name}/${n}` : n, uri: nextUri });
-                        }
-                    }
-                } catch { }
-            } else {
+                // 普通路径段：直接拼接
                 const nextUri = Uri.joinPath(cur.uri, seg);
-                const nextName = cur.name ? `${cur.name}/${seg}` : seg;
+                let nextIsDir = false;
                 try {
-                    const stat = await vscode.workspace.fs.stat(nextUri);
-                    if (!isLastSegment && !(stat.type & FileType.Directory)) continue;
-                    nextPathsMap.set(nextUri.toString(), { name: nextName, uri: nextUri });
-                } catch { }
-            }
-        }
-        currentPaths = Array.from(nextPathsMap.values());
-        if (currentPaths.length === 0) break;
-    }
-
-    const results: { name: string, uri: Uri, type: FileType }[] = [];
-    for (const p of currentPaths) {
-        try {
-            const stat = await vscode.workspace.fs.stat(p.uri);
-            const isDir = !!(stat.type & FileType.Directory);
-            if (onlyDirs && !isDir) continue;
-            results.push({ name: p.name || ".", uri: p.uri, type: stat.type });
-        } catch { }
-    }
-    return results;
-}
-
-export async function searchExistingPaths(baseUri: Uri, pattern: string, onlyDirs: boolean = false): Promise<{ name: string, uri: Uri, type: FileType }[]> {
-    const endsWithSlash = pattern.endsWith('/');
-    pattern = pattern.replace(/\\/g, '/');
-    let currentPaths = [{ name: "", uri: baseUri }];
-    const segments = pattern.split('/').filter(s => s.length > 0);
-
-    for (let i = 0; i < segments.length; i++) {
-        const seg = segments[i];
-        if (seg === '.') continue;
-
-        const isLastSegment = i === segments.length - 1;
-        const nextPathsMap = new Map<string, { name: string, uri: Uri }>();
-
-        for (const cur of currentPaths) {
-            if (seg === '..') {
-                const nextUri = Uri.joinPath(cur.uri, '..');
-                const nameParts = cur.name.split('/').filter(s => s.length > 0);
-                if (nameParts.length > 0 && nameParts[nameParts.length - 1] !== '..') nameParts.pop();
-                else nameParts.push('..');
-                nextPathsMap.set(nextUri.toString(), { name: nameParts.join('/'), uri: nextUri });
-            } else if (seg === '**') {
-                async function walk(u: Uri, relName: string, depth: number) {
-                    if (depth > 8) return;
-                    const key = u.toString();
-                    if (!nextPathsMap.has(key)) nextPathsMap.set(key, { name: relName, uri: u });
-                    try {
-                        const entries = await vscode.workspace.fs.readDirectory(u);
-                        for (const [n, t] of entries) {
-                            if (t & FileType.Directory) await walk(Uri.joinPath(u, n), relName ? `${relName}/${n}` : n, depth + 1);
-                        }
-                    } catch { }
+                    const s = await vscode.workspace.fs.stat(nextUri);
+                    nextIsDir = !!(s.type & FileType.Directory);
+                } catch {
+                    // 如果文件不存在且不是最后一段，则无法继续
+                    if (i < segments.length - 1) continue;
                 }
-                await walk(cur.uri, cur.name, 0);
-            } else {
-                try {
-                    const entries = await vscode.workspace.fs.readDirectory(cur.uri);
-                    const escaped = seg.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.');
-                    const regex = new RegExp(`^.*${escaped}.*$`, 'i');
 
-                    for (const [n, t] of entries) {
-                        if (regex.test(n)) {
-                            const isDir = !!(t & FileType.Directory);
-                            if (!isLastSegment && !isDir) continue;
-                            const nextUri = Uri.joinPath(cur.uri, n);
-                            nextPathsMap.set(nextUri.toString(), { name: cur.name ? `${cur.name}/${n}` : n, uri: nextUri });
-                        }
-                    }
-                } catch { }
+                next.push({
+                    name: cur.name ? `${cur.name}/${seg}` : seg,
+                    uri: nextUri,
+                    isDir: nextIsDir
+                });
             }
-        }
-        currentPaths = Array.from(nextPathsMap.values());
-    }
-
-    const results: { name: string, uri: Uri, type: FileType }[] = [];
-    for (const p of currentPaths) {
-        try {
-            const stat = await vscode.workspace.fs.stat(p.uri);
-            const isDir = !!(stat.type & FileType.Directory);
-            if (onlyDirs && !isDir) continue;
-            results.push({ name: p.name || ".", uri: p.uri, type: stat.type });
-            if (isDir && endsWithSlash) {
-                const entries = await vscode.workspace.fs.readDirectory(p.uri);
-                for (const [n, t] of entries) {
-                    if (onlyDirs && !(t & FileType.Directory)) continue;
-                    results.push({ name: p.name ? `${p.name}/${n}` : n, uri: Uri.joinPath(p.uri, n), type: t });
-                }
-            }
-        } catch { }
-    }
-    return results;
-}
-
-export async function resolveCreationPaths(baseUri: Uri, pattern: string): Promise<{ name: string, uri: Uri, isDir: boolean, exists: boolean, type?: FileType }[]> {
-    const expanded = expandBraces(pattern.replace(/\\/g, '/'));
-    const results: { name: string, uri: Uri, isDir: boolean, exists: boolean, type?: FileType }[] = [];
-
-    for (const exp of expanded) {
-        const isDir = exp.endsWith('/');
-        const cleanPath = isDir ? exp.slice(0, -1) : exp;
-        if (!cleanPath) continue;
-
-        const segments = cleanPath.split('/').filter(s => s.length > 0 && s !== '.');
-        let currentPaths = [{ name: "", uri: baseUri }];
-
-        for (let i = 0; i < segments.length; i++) {
-            const seg = segments[i];
-            const nextPathsMap = new Map<string, { name: string, uri: Uri }>();
-
-            if (seg === '**') {
-                const walk = async (u: Uri, relName: string, depth: number) => {
-                    if (depth > 8) return;
-                    const key = u.toString();
-                    if (!nextPathsMap.has(key)) nextPathsMap.set(key, { name: relName, uri: u });
-                    try {
-                        const entries = await vscode.workspace.fs.readDirectory(u);
-                        for (const [n, t] of entries) {
-                            if (t & FileType.Directory) await walk(Uri.joinPath(u, n), relName ? `${relName}/${n}` : n, depth + 1);
-                        }
-                    } catch { }
-                };
-                for (const cur of currentPaths) await walk(cur.uri, cur.name, 0);
-            } else if (seg.includes('*') || seg.includes('?')) {
-                for (const cur of currentPaths) {
-                    try {
-                        const entries = await vscode.workspace.fs.readDirectory(cur.uri);
-                        const regexStr = '^' + seg.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$';
-                        const regex = new RegExp(regexStr);
-                        for (const [n, t] of entries) {
-                            if (regex.test(n)) {
-                                const isDirNode = !!(t & FileType.Directory);
-                                if (i < segments.length - 1 && !isDirNode) continue;
-                                const nextUri = Uri.joinPath(cur.uri, n);
-                                nextPathsMap.set(nextUri.toString(), { name: cur.name ? `${cur.name}/${n}` : n, uri: nextUri });
-                            }
-                        }
-                    } catch { }
-                }
-            } else {
-                for (const cur of currentPaths) {
-                    if (seg === '..') {
-                        const nextUri = Uri.joinPath(cur.uri, '..');
-                        const nameParts = cur.name.split('/').filter(s => s.length > 0);
-                        if (nameParts.length > 0 && nameParts[nameParts.length - 1] !== '..') nameParts.pop();
-                        else nameParts.push('..');
-                        nextPathsMap.set(nextUri.toString(), { name: nameParts.join('/'), uri: nextUri });
-                    } else {
-                        const nextUri = Uri.joinPath(cur.uri, seg);
-                        const nextName = cur.name ? `${cur.name}/${seg}` : seg;
-                        nextPathsMap.set(nextUri.toString(), { name: nextName, uri: nextUri });
-                    }
-                }
-            }
-            currentPaths = Array.from(nextPathsMap.values());
-            if (currentPaths.length === 0) break;
+            current = next;
+            if (current.length === 0) break;
         }
 
-        for (const p of currentPaths) {
-            const name = p.name + (isDir ? '/' : '');
+        // 2️⃣ 最终结果构建
+        for (const p of current) {
+            const key = p.uri.toString();
+            if (seen.has(key)) continue;
+            seen.add(key);
+
             let exists = false;
             let type: FileType | undefined;
             try {
@@ -456,10 +280,74 @@ export async function resolveCreationPaths(baseUri: Uri, pattern: string): Promi
                 exists = true;
                 type = stat.type;
             } catch { }
-            results.push({ name, uri: p.uri, isDir, exists, type });
+
+            if (onlyExisting && !exists) continue;
+            const isDir = p.isDir;
+
+            // 处理目录展示意图 (末尾斜杠)
+            if (isDir && isDirHint && fuzzy) {
+                try {
+                    const entries = await vscode.workspace.fs.readDirectory(p.uri);
+                    for (const [childName, childType] of entries) {
+                        const childIsDir = !!(childType & FileType.Directory);
+                        if (onlyDirs && !childIsDir) continue;
+
+                        results.push({
+                            name: p.name === "." ? childName : `${p.name}/${childName}`,
+                            uri: Uri.joinPath(p.uri, childName),
+                            exists: true,
+                            type: childType,
+                            isDir: childIsDir
+                        });
+                    }
+                } catch { }
+                continue; // 用户输入了斜杠，通常不希望看到父目录本身
+            }
+
+            if (onlyDirs && !isDir) continue;
+            results.push({ name: p.name || ".", uri: p.uri, exists, type, isDir });
         }
     }
+
     return results;
+} export async function resolveExistingPaths(baseUri: Uri, pattern: string, onlyDirs: boolean = false): Promise<{ name: string, uri: Uri, type: FileType }[]> {
+    const res = await expandPaths(baseUri, pattern, {
+        onlyExisting: true,
+        onlyDirs,
+        fuzzy: false
+    });
+
+    return res.map(r => ({
+        name: r.name,
+        uri: r.uri,
+        type: r.type!
+    }));
+}
+
+export async function searchExistingPaths(baseUri: Uri, pattern: string, onlyDirs: boolean = false): Promise<{ name: string, uri: Uri, type: FileType }[]> {
+    const res = await expandPaths(baseUri, pattern, {
+        onlyExisting: true,
+        onlyDirs,
+        fuzzy: true
+    });
+
+    return res.map(r => ({
+        name: r.name,
+        uri: r.uri,
+        type: r.type!
+    }));
+}
+
+export async function resolveCreationPaths(baseUri: Uri, pattern: string): Promise<{ name: string, uri: Uri, isDir: boolean, exists: boolean, type?: FileType }[]> {
+    const res = await expandPaths(baseUri, pattern);
+
+    return res.map(r => ({
+        name: r.name + (r.isDir ? '/' : ''),
+        uri: r.uri,
+        isDir: r.isDir,
+        exists: r.exists,
+        type: r.type
+    }));
 }
 
 // ================= 配置与上下文 =================
@@ -588,7 +476,16 @@ class FileBrowser {
             editor.setDecorations(rangeDecorationType, []);
         });
     }
-
+    private getRelativeDisplayPath(uri: Uri): string {
+        // 计算相对于当前 browser 所在的 this.path 的路径
+        let rel = OSPath.relative(this.path.uri.fsPath, uri.fsPath);
+        if (!rel) return ".";
+        // 统一使用正斜杠
+        rel = rel.replace(/\\/g, '/');
+        // 如果是在当前目录下的文件，去掉 ./ 
+        if (rel.startsWith('./')) rel = rel.substring(2);
+        return rel;
+    }
     private pushState() {
         this.stateStack.push({
             path: this.path.clone(),
@@ -815,7 +712,15 @@ class FileBrowser {
     async handlePathSearch(value: string) {
         const token = ++this.searchToken; this.current.busy = true;
         let displayItems: FileItem[] = [];
-        try { const matched = await searchExistingPaths(this.path.uri, value); displayItems = matched.map(m => new FileItem([m.name, m.type])); } catch (e) { }
+        try {
+            const matched = await searchExistingPaths(this.path.uri, value);
+            displayItems = matched.map(m => {
+                const item = new FileItem([m.name, m.type]);
+                // 这里的 m.name 现在会包含像 "../../target" 这样的路径
+                item.label = (m.type & FileType.Directory) ? `$(folder) ${m.name}` : `$(file) ${m.name}`;
+                return item;
+            });
+        } catch (e) { }
         if (this.searchToken !== token) return;
         const exactItem = { label: `$(go-to-file) Open / Create Path: ${value}`, name: value, description: "Will create missing directories automatically", alwaysShow: true, action: Action.OpenFile, } as FileItem;
         this.current.items = [exactItem, ...displayItems];
@@ -869,7 +774,17 @@ class FileBrowser {
         try {
             const globPattern = toCaseInsensitiveGlob(query); const files = await vscode.workspace.findFiles(`**/*${globPattern}*`, '**/node_modules/**', 50);
             if (this.searchToken !== token) return;
-            this.current.items = files.map(uri => ({ label: `$(file) ${OSPath.basename(uri.fsPath)}`, description: vscode.workspace.asRelativePath(uri), name: OSPath.basename(uri.fsPath), alwaysShow: true, payload: uri, fileType: FileType.File, } as FileItem));
+            this.current.items = files.map(uri => {
+                const relToCurrent = this.getRelativeDisplayPath(uri);
+                return {
+                    label: `$(file) ${OSPath.basename(uri.fsPath)}`,
+                    description: `rel: ${relToCurrent}`, // 这里显示相对于当前文件夹的路径
+                    name: OSPath.basename(uri.fsPath),
+                    alwaysShow: true,
+                    payload: uri,
+                    fileType: FileType.File,
+                } as FileItem;
+            });
         } catch (e) { } finally { if (this.searchToken === token) this.current.busy = false; }
     }
 
@@ -901,7 +816,17 @@ class FileBrowser {
             if (finalCreatePaths.length > 0 && (value.includes('{') || finalCreatePaths.length > 1)) {
                 items.push({ label: `$(new-file) Create Pattern: ${value}`, name: value, description: `Execute bulk create (${finalCreatePaths.length} items)`, alwaysShow: true, action: Action.BulkCreate, payload: finalCreatePaths } as FileItem);
             }
-            for (const m of existingMatches) { items.push({ label: (m.type & FileType.Directory) ? `$(folder) ${m.name}` : `$(file) ${m.name}`, name: m.name, description: "Existing Match", alwaysShow: true, fileType: m.type, payload: m.uri } as FileItem); }
+            for (const m of existingMatches) {
+                items.push({
+                    // m.name 现在通过 expandPaths 会返回用户输入的相对形式
+                    label: (m.type & FileType.Directory) ? `$(folder) ${m.name}` : `$(file) ${m.name}`,
+                    name: m.name,
+                    description: "Existing Match",
+                    alwaysShow: true,
+                    fileType: m.type,
+                    payload: m.uri
+                } as FileItem);
+            }
             for (const p of finalCreatePaths) { items.push({ label: p.isDir ? `$(add) [Folder] ${p.name}/` : `$(add) ${p.name}`, name: p.name, description: "Preview (Click to create single item)", alwaysShow: true, action: Action.SingleCreate, payload: p } as FileItem); }
             this.current.items = items; if (items.length > 0) this.current.activeItems = [items[0]];
         } catch (e) { } this.current.busy = false;
@@ -953,30 +878,83 @@ class FileBrowser {
 
         // --- 处理 Copy / Move 逻辑 ---
         if (matchPattern && (action === Action.BulkCopy || action === Action.BulkMove) && parts.length >= 2) {
-            const fromPattern = parts[0], toPattern = parts[1];
+
+            const fromPattern = parts[0];
+            const toPattern = parts[1];
             const isMove = action === Action.BulkMove;
 
-            // 修正目标解析逻辑
-            const isDestDir = toPattern.endsWith('/') || toPattern.endsWith('\\');
-            const destNamePart = isDestDir ? "*" : OSPath.basename(toPattern);
-            const destDirPart = isDestDir ? toPattern : (OSPath.dirname(toPattern) === '.' ? "" : OSPath.dirname(toPattern));
+            let sources: ExpandedPath[] = [];
+            let dests: ExpandedPath[] = [];
 
-            // 获取预览用的目标基础路径
-            const previewDestUri = destDirPart ? Uri.joinPath(this.path.uri, destDirPart) : this.path.uri;
+            try {
+                sources = await expandPaths(this.path.uri, fromPattern, {
+                    onlyExisting: true
+                });
 
-            label = `${isMove ? 'Move' : 'Copy'} ${resolvedSources.length} items to '${toPattern}'`;
-            payload = { match: fromPattern, dest: toPattern };
+                dests = await expandPaths(this.path.uri, toPattern, {
+                    onlyExisting: false
+                });
+            } catch { }
 
-            exactMatchedItems = resolvedSources.map(p => {
-                const oldBase = OSPath.basename(p.name);
-                const newBase = isDestDir ? oldBase : (applyWildcard(oldBase, OSPath.basename(fromPattern), destNamePart) || oldBase);
-                const targetUri = Uri.joinPath(previewDestUri, newBase);
-                return {
-                    label: `$(arrow-right) ${p.name} -> ${vscode.workspace.asRelativePath(targetUri)}`,
-                    name: p.name, alwaysShow: true, action: isMove ? Action.SingleMove : Action.SingleCopy,
-                    payload: { oldUri: p.uri, newUri: targetUri }
-                } as FileItem;
-            });
+            if (this.searchToken !== token) return;
+
+            const mappings: { src: ExpandedPath, target: Uri }[] = [];
+
+            for (const src of sources) {
+                for (const dest of dests) {
+
+                    let target: Uri;
+
+                    const srcBase = OSPath.basename(src.name);
+
+                    // 👉 判断 dest 是目录还是 pattern
+                    const isDestDir =
+                        dest.isDir ||
+                        toPattern.endsWith('/') ||
+                        toPattern.endsWith('\\');
+
+                    if (isDestDir) {
+                        // 📁 目录模式
+                        target = Uri.joinPath(dest.uri, srcBase);
+                    } else {
+                        // 🔁 pattern rename
+                        const newBase = applyWildcard(
+                            srcBase,
+                            OSPath.basename(fromPattern),
+                            OSPath.basename(toPattern)
+                        ) || srcBase;
+
+                        target = Uri.joinPath(dest.uri, '..', newBase);
+                    }
+
+                    mappings.push({ src, target });
+                }
+            }
+
+            // --- Preview items ---
+            const previewItems: FileItem[] = mappings.map(m => ({
+                label: `$(arrow-right) ${m.src.name} → ${vscode.workspace.asRelativePath(m.target)}`,
+                name: m.src.name,
+                alwaysShow: true,
+                action: isMove ? Action.SingleMove : Action.SingleCopy,
+                payload: {
+                    oldUri: m.src.uri,
+                    newUri: m.target
+                }
+            }));
+
+            // --- 顶部执行项 ---
+            finalItems.push({
+                label: `$(zap) ${isMove ? 'Move' : 'Copy'} ${mappings.length} items`,
+                name: fullQuery,
+                alwaysShow: true,
+                action,
+                payload: {
+                    mappings
+                }
+            } as FileItem);
+
+            finalItems.push(...previewItems);
 
         } else if (matchPattern && action === Action.BulkRename && parts.length >= 2) {
             const from = parts[0], to = parts[1];
@@ -1151,32 +1129,33 @@ class FileBrowser {
                 }
                 case Action.BulkMove:
                 case Action.BulkCopy: {
-                    const { match, dest } = item.payload;
                     const isMove = item.action === Action.BulkMove;
-                    const resolvedSources = await resolveExistingPaths(this.path.uri, match);
-                    if (resolvedSources.length === 0) return;
+                    const { mappings } = item.payload as {
+                        mappings: { src: ExpandedPath, target: Uri }[]
+                    };
 
-                    const isDestDir = dest.endsWith('/') || dest.endsWith('\\');
-                    const destDirPart = isDestDir ? dest : (OSPath.dirname(dest) === '.' ? "" : OSPath.dirname(dest));
-                    const destNamePart = isDestDir ? "*" : OSPath.basename(dest);
+                    if (!mappings || mappings.length === 0) return;
 
-                    const baseDestUri = destDirPart ? Uri.joinPath(this.path.uri, destDirPart) : this.path.uri;
+                    if (!await this.confirmAction(`${isMove ? 'Move' : 'Copy'} ${mappings.length} items?`)) return;
 
-                    if (!await this.confirmAction(`${isMove ? 'Move' : 'Copy'} ${resolvedSources.length} items?`)) return;
+                    for (const m of mappings) {
+                        const { src, target } = m;
 
-                    for (const r of resolvedSources) {
-                        const oldBase = OSPath.basename(r.name);
-                        const newBase = isDestDir ? oldBase : (applyWildcard(oldBase, OSPath.basename(match), destNamePart) || oldBase);
-                        const targetUri = Uri.joinPath(baseDestUri, newBase);
+                        ensureSafe(target);
 
-                        ensureSafe(targetUri);
-                        await vscode.workspace.fs.createDirectory(Uri.joinPath(targetUri, '..'));
+                        await vscode.workspace.fs.createDirectory(Uri.joinPath(target, '..'));
+
                         try {
-                            if (isMove) await vscode.workspace.fs.rename(r.uri, targetUri, { overwrite: false });
-                            else await vscode.workspace.fs.copy(r.uri, targetUri, { overwrite: false });
-                        } catch (e) { }
+                            if (isMove) {
+                                await vscode.workspace.fs.rename(src.uri, target, { overwrite: false });
+                            } else {
+                                await vscode.workspace.fs.copy(src.uri, target, { overwrite: false });
+                            }
+                        } catch { }
                     }
-                    await this.update(); break;
+
+                    await this.update();
+                    break;
                 }
                 case Action.NewFolder: { ensureSafe(this.path.uri); await vscode.workspace.fs.createDirectory(this.path.uri); await this.update(); break; }
                 case Action.OpenFile:
