@@ -126,7 +126,7 @@ export class Path {
     async isFile(): Promise<boolean> {
         const stat = await this.stat();
         return stat.match(
-            (stat) => !!(stat.type | FileType.File),
+            (stat) => !!(stat.type & FileType.File),
             () => false
         );
     }
