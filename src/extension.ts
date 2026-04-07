@@ -1,3 +1,4 @@
+
 import * as vscode from "vscode";
 import { Uri, FileType, QuickInputButton, ThemeIcon, ViewColumn, DocumentSymbol } from "vscode";
 import * as OS from "os";
@@ -10,7 +11,6 @@ import { FileItem, fileRecordCompare, itemIsDir } from "./fileitem";
 import { action, Action } from "./action";
 
 // ================= 工具函数 =================
-// 将普通字符串转为不区分大小写的 Glob 字符串 (例如 "abc" -> "[aA][bB][cC]")
 function toCaseInsensitiveGlob(str: string): string {
     return str.split('').map(c => {
         if (/[a-zA-Z]/.test(c)) {
@@ -19,7 +19,7 @@ function toCaseInsensitiveGlob(str: string): string {
         return c;
     }).join('');
 }
-// 文本搜索的高亮：使用原生的“查找匹配”颜色
+
 const searchDecorationType = vscode.window.createTextEditorDecorationType({
     backgroundColor: new vscode.ThemeColor('editor.findMatchHighlightBackground'),
     overviewRulerColor: new vscode.ThemeColor('editor.findMatchHighlightBackground'),
@@ -28,10 +28,9 @@ const searchDecorationType = vscode.window.createTextEditorDecorationType({
     borderRadius: '2px'
 });
 
-// 符号/行跳转的高亮：使用原生的“整行/区域”背景高亮
 const rangeDecorationType = vscode.window.createTextEditorDecorationType({
     backgroundColor: new vscode.ThemeColor('editor.rangeHighlightBackground'),
-    isWholeLine: true, // 符号跳转通常高亮整行或整个区域
+    isWholeLine: true,
 });
 
 function getSymbolIcon(kind: vscode.SymbolKind): string {
@@ -188,11 +187,6 @@ interface ViewState {
     targetPayload?: any;
 }
 
-interface AutoCompletion {
-    index: number;
-    items: FileItem[];
-}
-
 class FileBrowser {
     current: vscode.QuickPick<FileItem>;
 
@@ -209,7 +203,6 @@ class FileBrowser {
 
     pathHistory: { [path: string]: Option<string> };
     keepAlive: boolean = false;
-    autoCompletion?: AutoCompletion;
 
     editorUri?: Uri;
     private searchToken = 0;
@@ -247,7 +240,6 @@ class FileBrowser {
 
     // ================= Preview =================
     private previewTimeout?: NodeJS.Timeout;
-    private lastPreviewUri?: Uri;
     private urisToClose = new Set<string>();
     private async preview(item: FileItem) {
         if (this.inActions) return;
@@ -277,7 +269,6 @@ class FileBrowser {
             let range: vscode.Range | undefined;
             let selectionRange: vscode.Range | undefined;
 
-            // 解析 payload
             if (item.payload?.uri) {
                 uri = item.payload.uri;
                 range = item.payload.range;
@@ -292,7 +283,6 @@ class FileBrowser {
                 return;
             }
 
-            // 【修复 2.2】：在展示之前再加一层防线。调用 showTextDocument 试图打开目录会直接抛错，导致整个 UI 崩溃退出。
             try {
                 const stat = await vscode.workspace.fs.stat(uri);
                 if (stat.type & FileType.Directory) {
@@ -302,7 +292,6 @@ class FileBrowser {
                 return;
             }
 
-            this.lastPreviewUri = uri;
             this.urisToClose.add(uri.toString());
 
             let targetColumn = vscode.window.tabGroups.activeTabGroup.viewColumn == vscode.ViewColumn.One ? vscode.ViewColumn.Two : vscode.ViewColumn.One;
@@ -316,18 +305,15 @@ class FileBrowser {
 
                 if (range && !editor.selection.active.isEqual(range.start)) {
                     this.clearDecorations();
-                    // 1. 设置光标位置（Selection）
                     const targetPos = selectionRange || range;
                     editor.selection = new vscode.Selection(targetPos.start, targetPos.end);
 
-                    // 2. 应用装饰器高亮（Decoration）
                     if (item.action === Action.GoToLine) {
                         editor.setDecorations(rangeDecorationType, [range]);
                     } else {
                         editor.setDecorations(searchDecorationType, [range]);
                     }
 
-                    // 3. 滚动到视图
                     editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
                 }
             } catch (e) { }
@@ -342,18 +328,15 @@ class FileBrowser {
                 if (tab.input instanceof vscode.TabInputText) {
                     const uriStr = tab.input.uri.toString();
                     if (this.urisToClose.has(uriStr)) {
-                        // 绝对只关闭 isPreview 的标签页，绝不碰用户正常打开的同名文件
                         if (tab.isPreview) {
                             vscode.window.tabGroups.close(tab, true);
                         }
-                        // 处理过就从黑名单移除
                         this.urisToClose.delete(uriStr);
                     }
                 }
             }
         }
     }
-    // 辅助方法：清除所有高亮
     private clearDecorations() {
         vscode.window.visibleTextEditors.forEach(editor => {
             editor.setDecorations(searchDecorationType, []);
@@ -361,9 +344,7 @@ class FileBrowser {
         });
     }
 
-
     // ================= 核心架构：视图状态管理 =================
-
     private pushState() {
         this.stateStack.push({
             path: this.path.clone(),
@@ -400,7 +381,6 @@ class FileBrowser {
     }
 
     // ================= UI 生命周期与事件 =================
-
     dispose() {
         this.closePreviewTab();
         this.clearDecorations();
@@ -469,7 +449,6 @@ class FileBrowser {
     }
 
     // ================= 路由与导航 (Navigation) =================
-
     async stepIn() {
         this.activeItem().ifSome(async (item) => {
             if (item.action !== undefined && !(item.payload && item.payload.name)) {
@@ -540,17 +519,13 @@ class FileBrowser {
     }
 
     onDidAccept() {
-        this.autoCompletion = undefined;
         this.stepIn();
     }
 
     // ================= 搜索与输入处理 (Input Handlers) =================
-
-    async onDidChangeValue(value: string, isAutoComplete = false) {
+    async onDidChangeValue(value: string) {
         if (this.isRestoringState || this.inActions) return;
-        if (!isAutoComplete) this.autoCompletion = undefined;
 
-        // 【关键修复 1】：只要内容变化，立刻增加 token，强制掐断所有还在后台等待的异步搜索
         ++this.searchToken;
 
         if (this.searchTimeout) {
@@ -579,7 +554,7 @@ class FileBrowser {
 
         if (value.match(/^[rdcm]:/)) {
             const m: { [k: string]: Action } = { 'r': Action.BulkRename, 'd': Action.BulkDelete, 'c': Action.BulkCopy, 'm': Action.BulkMove };
-            return this.debounce(() => this.handleBulkOp(value.substring(2), m[value[0]]));
+            return this.debounce(() => this.handleBulkOp(value, m[value[0]]));
         }
 
         if (value.includes("{") || value.includes("*") || value.includes("?")) {
@@ -605,7 +580,7 @@ class FileBrowser {
 
         this.current.items = displayItems;
         if (displayItems.length > 0) this.current.activeItems = [displayItems[0]];
-        this.current.busy = false; // 结束同步搜索的加载状态
+        this.current.busy = false;
     }
 
     private debounce(func: () => void | Promise<void>, delay: number = 250) {
@@ -634,7 +609,6 @@ class FileBrowser {
                         const line = doc.lineAt(i);
                         const index = line.text.toLowerCase().indexOf(q);
                         if (index !== -1) {
-                            // 精确计算关键词范围
                             const matchRange = new vscode.Range(i, index, i, index + q.length);
                             results.push(this.createTextMatchItem(doc.uri, line.text, i, matchRange));
                         }
@@ -659,7 +633,6 @@ class FileBrowser {
                                 const lineText = lines[lineIdx];
                                 const index = lineText.toLowerCase().indexOf(q);
                                 if (index !== -1) {
-                                    // 精确计算关键词范围
                                     const matchRange = new vscode.Range(lineIdx, index, lineIdx, index + q.length);
                                     results.push(this.createTextMatchItem(uri, lineText, lineIdx, matchRange));
                                 }
@@ -872,7 +845,6 @@ class FileBrowser {
             return;
         }
 
-        // 修正为标准的 payload 结构，供预览和跳转统一使用
         const targetLine = Math.max(0, line - 1);
         const range = new vscode.Range(targetLine, 0, targetLine, 0);
 
@@ -880,6 +852,7 @@ class FileBrowser {
             label: `$(go-to-file) Go to line ${line}`, name: query, alwaysShow: true, fileType: FileType.File, payload: { uri: this.editorUri, range }
         } as FileItem];
     }
+
     async handleGlobalFileSearch(query: string) {
         const token = ++this.searchToken;
         query = query.trim();
@@ -889,7 +862,6 @@ class FileBrowser {
         }
         this.current.busy = true;
         try {
-            // 使用新工具函数，使得文件搜索不再区分大小写
             const globPattern = toCaseInsensitiveGlob(query);
             const files = await vscode.workspace.findFiles(`**/*${globPattern}*`, '**/node_modules/**', 50);
             if (this.searchToken !== token) return;
@@ -911,7 +883,6 @@ class FileBrowser {
         }
         this.current.busy = true;
         try {
-            // 使用新工具函数，使得文件夹搜索不再区分大小写
             const globPattern = toCaseInsensitiveGlob(query);
             const files = await vscode.workspace.findFiles(`**/*${globPattern}*/**`, '**/node_modules/**', 200);
             if (this.searchToken !== token) return;
@@ -1008,114 +979,149 @@ class FileBrowser {
         this.current.busy = false;
     }
 
-    async handleBulkOp(query: string, action: Action) {
+    // 重构的 Bulk Operation：完美解决盲打问题
+    async handleBulkOp(fullQuery: string, action: Action) {
         const token = ++this.searchToken;
         this.current.busy = true;
 
-        const parts = splitArgs(query.trim());
+        const queryValue = fullQuery.substring(2); // 取出前缀后的内容 (e.g. "d:*")
+        const parts = splitArgs(queryValue.trim());
+
         let label = "";
         let payload: any = {};
         let matchedFiles: FileItem[] = [];
 
-        if (parts.length > 0) {
-            const matchPattern = parts[0];
-            const onlyDirs = matchPattern.endsWith('/');
-            const isSingleArg = parts.length === 1;
+        const matchPattern = parts.length > 0 ? parts[0] : "";
+        const onlyDirs = matchPattern.endsWith('/');
+        const isSingleArg = parts.length === 1;
 
-            if (isSingleArg && this.editorUri) {
-                if ((action === Action.BulkCopy || action === Action.BulkMove)) {
-                    const oldUri = this.editorUri;
-                    const newBase = parts[0];
-                    const isMove = action === Action.BulkMove;
-                    const item = {
-                        label: `$(files) ${isMove ? 'Move' : 'Copy'} current file to '${newBase}'`, name: newBase,
-                        alwaysShow: true, action: isMove ? Action.SingleMove : Action.SingleCopy, payload: { oldUri, newUri: Uri.joinPath(oldUri, '..', newBase) }
-                    } as FileItem;
-                    this.current.items = [item];
-                    this.current.busy = false;
-                    return;
-                } else if (action === Action.BulkRename) {
-                    const oldUri = this.editorUri;
-                    const newBase = parts[0];
-                    const item = {
-                        label: `$(edit) Rename current file to '${newBase}'`, name: newBase,
-                        alwaysShow: true, action: Action.SingleRename, payload: { oldUri, newUri: Uri.joinPath(oldUri, '..', newBase) }
-                    } as FileItem;
-                    this.current.items = [item];
-                    this.current.busy = false;
-                    return;
-                }
+        // --- 编辑器单文件快速操作 ---
+        if (isSingleArg && this.editorUri && matchPattern) {
+            if ((action === Action.BulkCopy || action === Action.BulkMove)) {
+                const oldUri = this.editorUri;
+                const newBase = matchPattern;
+                const isMove = action === Action.BulkMove;
+                this.current.items = [{
+                    label: `$(files) ${isMove ? 'Move' : 'Copy'} current file to '${newBase}'`, name: newBase,
+                    alwaysShow: true, action: isMove ? Action.SingleMove : Action.SingleCopy, payload: { oldUri, newUri: Uri.joinPath(oldUri, '..', newBase) }
+                } as FileItem];
+                this.current.busy = false;
+                return;
+            } else if (action === Action.BulkRename) {
+                const oldUri = this.editorUri;
+                const newBase = matchPattern;
+                this.current.items = [{
+                    label: `$(edit) Rename current file to '${newBase}'`, name: newBase,
+                    alwaysShow: true, action: Action.SingleRename, payload: { oldUri, newUri: Uri.joinPath(oldUri, '..', newBase) }
+                } as FileItem];
+                this.current.busy = false;
+                return;
             }
+        }
+
+        let resolvedPaths: { name: string, uri: Uri }[] = [];
+        if (matchPattern) {
             try {
-                const resolvedPaths = await expandPathWildcards(this.path.uri, matchPattern, true);
-                if (this.searchToken !== token) return;
-
-                if ((action === Action.BulkCopy || action === Action.BulkMove) && parts.length >= 2) {
-                    const isMove = action === Action.BulkMove;
-                    const fromPattern = parts[0], toPattern = parts[1];
-                    const isDestDir = toPattern.endsWith('/') || toPattern.endsWith('\\');
-                    const destDirPart = isDestDir ? toPattern : OSPath.dirname(toPattern);
-                    const destFilePart = isDestDir ? "*" : OSPath.basename(toPattern);
-
-                    let resolvedDests: { name: string, uri: Uri }[] = [];
-                    if (destDirPart.includes('*') || destDirPart.includes('?')) {
-                        resolvedDests = await expandPathWildcards(this.path.uri, destDirPart, true, true);
-                    } else {
-                        resolvedDests = [{ name: destDirPart, uri: this.path.append(...destDirPart.split('/')).uri }];
-                    }
-
-                    label = `${isMove ? 'Move' : 'Copy'} matching items to ${resolvedDests.length} location(s)`;
-                    payload = { match: fromPattern, dest: toPattern };
-
-                    matchedFiles = resolvedPaths.map(p => {
-                        const oldBase = OSPath.basename(p.name);
-                        const targetDir = resolvedDests[0]?.uri || this.path.uri;
-                        let newBase = oldBase;
-                        if (!isDestDir) newBase = applyWildcard(oldBase, OSPath.basename(fromPattern), destFilePart) || oldBase;
-                        const newUri = Uri.joinPath(targetDir, newBase);
-                        const countSuffix = resolvedDests.length > 1 ? ` (+${resolvedDests.length - 1} dirs)` : "";
-
-                        return {
-                            label: `$(arrow-right) ${p.name} -> ${vscode.workspace.asRelativePath(newUri)}${countSuffix}`,
-                            name: p.name, alwaysShow: true, action: isMove ? Action.SingleMove : Action.SingleCopy, payload: { oldUri: p.uri, newUri }
-                        } as FileItem;
-                    });
-                } else if (action === Action.BulkRename && parts.length >= 2) {
-                    const from = parts[0], to = parts[1];
-                    label = `Rename matching '${from}' to '${to}'`;
-                    payload = { from, to };
-                    matchedFiles = resolvedPaths.map(p => {
-                        const oldBase = OSPath.basename(p.name);
-                        const newBase = applyWildcard(oldBase, OSPath.basename(from), OSPath.basename(to)) || oldBase;
-                        const dir = OSPath.dirname(p.name);
-                        const newUri = Uri.joinPath(Uri.joinPath(p.uri, '..'), newBase);
-
-                        return {
-                            label: `$(arrow-right) ${p.name} -> ${dir === "." ? newBase : `${dir}/${newBase}`}`,
-                            name: p.name, alwaysShow: true, action: Action.SingleRename, payload: { oldUri: p.uri, newUri }
-                        } as FileItem;
-                    });
-                } else if (action === Action.BulkDelete) {
-                    label = `Delete matching '${matchPattern}' (${resolvedPaths.length} items)`;
-                    payload = { match: matchPattern, onlyDirs };
-                    matchedFiles = resolvedPaths.map(p => ({
-                        label: `$(trash) ${p.name}`, name: p.name, alwaysShow: true, action: Action.SingleDelete, payload: { uri: p.uri }
-                    } as FileItem));
-                }
+                resolvedPaths = await expandPathWildcards(this.path.uri, matchPattern, true);
             } catch (e) { }
         }
 
-        const items: FileItem[] = [];
-        if (label) items.push({ label: `$(zap) ${label}`, name: query, alwaysShow: true, action, payload } as FileItem);
-        else items.push({ label: "Keep typing pattern...", name: "", alwaysShow: true } as FileItem);
+        if (this.searchToken !== token) return;
 
+        // --- 构建批量操作菜单与精确匹配项 ---
+        if (matchPattern && (action === Action.BulkCopy || action === Action.BulkMove) && parts.length >= 2) {
+            const isMove = action === Action.BulkMove;
+            const fromPattern = parts[0], toPattern = parts[1];
+            const isDestDir = toPattern.endsWith('/') || toPattern.endsWith('\\');
+            const destDirPart = isDestDir ? toPattern : OSPath.dirname(toPattern);
+            const destFilePart = isDestDir ? "*" : OSPath.basename(toPattern);
+
+            let resolvedDests: { name: string, uri: Uri }[] = [];
+            if (destDirPart.includes('*') || destDirPart.includes('?')) {
+                resolvedDests = await expandPathWildcards(this.path.uri, destDirPart, true, true);
+            } else {
+                resolvedDests = [{ name: destDirPart, uri: this.path.append(...destDirPart.split('/')).uri }];
+            }
+
+            label = `${isMove ? 'Move' : 'Copy'} matching items to ${resolvedDests.length} location(s)`;
+            payload = { match: fromPattern, dest: toPattern };
+
+            matchedFiles = resolvedPaths.map(p => {
+                const oldBase = OSPath.basename(p.name);
+                const targetDir = resolvedDests[0]?.uri || this.path.uri;
+                let newBase = oldBase;
+                if (!isDestDir) newBase = applyWildcard(oldBase, OSPath.basename(fromPattern), destFilePart) || oldBase;
+                const newUri = Uri.joinPath(targetDir, newBase);
+                const countSuffix = resolvedDests.length > 1 ? ` (+${resolvedDests.length - 1} dirs)` : "";
+
+                return {
+                    label: `$(arrow-right) ${p.name} -> ${vscode.workspace.asRelativePath(newUri)}${countSuffix}`,
+                    name: p.name, alwaysShow: true, action: isMove ? Action.SingleMove : Action.SingleCopy, payload: { oldUri: p.uri, newUri }
+                } as FileItem;
+            });
+        } else if (matchPattern && action === Action.BulkRename && parts.length >= 2) {
+            const from = parts[0], to = parts[1];
+            label = `Rename matching '${from}' to '${to}'`;
+            payload = { from, to };
+            matchedFiles = resolvedPaths.map(p => {
+                const oldBase = OSPath.basename(p.name);
+                const newBase = applyWildcard(oldBase, OSPath.basename(from), OSPath.basename(to)) || oldBase;
+                const dir = OSPath.dirname(p.name);
+                const newUri = Uri.joinPath(Uri.joinPath(p.uri, '..'), newBase);
+
+                return {
+                    label: `$(arrow-right) ${p.name} -> ${dir === "." ? newBase : `${dir}/${newBase}`}`,
+                    name: p.name, alwaysShow: true, action: Action.SingleRename, payload: { oldUri: p.uri, newUri }
+                } as FileItem;
+            });
+        } else if (action === Action.BulkDelete) {
+            label = matchPattern
+                ? `Delete matching '${matchPattern}' (${resolvedPaths.length} items)`
+                : `Type to bulk delete items...`;
+            payload = { match: matchPattern, onlyDirs };
+            matchedFiles = resolvedPaths.map(p => ({
+                label: `$(trash) ${p.name} (Matched)`,
+                name: p.name, alwaysShow: true, action: Action.SingleDelete, payload: { uri: p.uri }
+            } as FileItem));
+        } else {
+            // 参数不足时显示提示信息
+            const opName = action === Action.BulkRename ? "Rename" : action === Action.BulkCopy ? "Copy" : "Move";
+            label = matchPattern ? `${opName} '${matchPattern}'... (provide destination)` : `Bulk ${opName}: type pattern and destination...`;
+        }
+
+        const items: FileItem[] = [];
+
+        // 1. 插入执行操作主按钮
+        if (matchPattern && resolvedPaths.length > 0 && payload && Object.keys(payload).length > 0) {
+            items.push({ label: `$(zap) ${label}`, name: fullQuery, alwaysShow: true, action, payload } as FileItem);
+        } else {
+            items.push({ label: `$(info) ${label}`, name: fullQuery, alwaysShow: true } as FileItem);
+        }
+
+        // 2. 插入命中操作的具体文件列表
         items.push(...matchedFiles);
+
+        // 3. 将当前目录尚未匹配到的文件也一并列出 (打破盲打)
+        const matchedNames = new Set(resolvedPaths.map(p => p.name));
+        const filterStr = matchPattern.replace(/[*?^{}()|[\]\\]/g, '').toLowerCase();
+
+        const envItems = this.items.filter(item => {
+            if (item.action !== undefined) return false;
+            if (matchedNames.has(item.name)) return false;
+            return item.name.toLowerCase().includes(filterStr);
+        });
+
+        if (envItems.length > 0) {
+            items.push({ label: "--- Directory Contents ---", name: "", alwaysShow: true, description: "Unmatched / Context" } as FileItem);
+            items.push(...envItems);
+        }
+
         this.current.items = items;
+        if (items.length > 0) this.current.activeItems = [items[0]];
         this.current.busy = false;
     }
 
     // ================= 文件操作与执行 (Actions) =================
-
     openFile(uri: Uri, column?: ViewColumn, range?: vscode.Range, selectionRange?: vscode.Range) {
         if (this.previewTimeout) {
             clearTimeout(this.previewTimeout);
@@ -1140,7 +1146,6 @@ class FileBrowser {
         this.dispose();
 
         vscode.workspace.openTextDocument(uri).then((doc) => {
-            // 显式传入 preview: false 强制其作为非 Preview 的实体文件打开
             vscode.window.showTextDocument(doc, {
                 viewColumn: targetColumn || ViewColumn.Active,
                 preview: false
@@ -1388,38 +1393,123 @@ class FileBrowser {
         }
     }
 
-    tabCompletion(tabNext: boolean) {
+
+    // 重构的 Tab 自动补全机制：像终端一样智能补全（Partial match / LCP）
+    tabCompletion() {
         if (this.inActions) return;
-        if (!this.autoCompletion || this.autoCompletion.items.length !== this.current.items.length) {
-            const currentVisibleItems = this.current.items as FileItem[];
-            if (currentVisibleItems.length === 0) return;
-            this.autoCompletion = { index: -1, items: currentVisibleItems };
-        }
-
-        const { items } = this.autoCompletion;
-        const length = items.length;
-        const step = tabNext ? 1 : -1;
-
-        this.autoCompletion.index = (this.autoCompletion.index + step + length) % length;
-        const selectedItem = items[this.autoCompletion.index];
 
         const val = this.current.value;
 
+        // 1. 在特殊的非路径查找模式中，禁用补全
         if (val.match(/^(\$\$|\$|%%|%|@@|@|!|#|:)/)) {
-            this.current.activeItems = [selectedItem];
             return;
         }
 
-        const prefixMatch = val.match(/^([rdcm]:)/);
-        const prefix = prefixMatch ? prefixMatch[0] : "";
+        // 2. 找到当前正在输入的最后一个词 (以空格分隔的最后一部分，支持多参数如 r:*.js *.t)
+        const tokenMatch = val.match(/(\S+)$/);
+        if (!tokenMatch) return; // 输入以空格结尾或为空
+        const token = tokenMatch[1];
+        const tokenPrefix = val.substring(0, val.length - token.length);
 
-        let newValue = selectedItem.name;
-        if (prefix && !newValue.startsWith(prefix)) newValue = prefix + newValue;
-        if (selectedItem.fileType === FileType.Directory && !newValue.endsWith('/')) newValue += "/";
+        // 3. 提取可能的命令前缀 (e.g. d:, r:, c:, m:)
+        const prefixMatch = token.match(/^([rdcm]:)/);
+        const cmdPrefix = prefixMatch ? prefixMatch[0] : "";
+        const restToken = token.substring(cmdPrefix.length);
 
-        this.current.value = newValue;
-        this.current.activeItems = [selectedItem];
-        this.onDidChangeValue(this.current.value, true);
+        // 4. 将剩余路径拆分为目录部分和搜索部分
+        const lastSlashIdx = restToken.lastIndexOf('/');
+        const searchPart = restToken.substring(lastSlashIdx + 1);
+
+        // 5. 如果 searchPart 以 * 或 ? 结尾，此时不适合做普通的后缀补全
+        if (/[*?]$/.test(searchPart)) return;
+
+        // 提取末尾实际输入的字面字符（忽略前面如 * 的 glob 字符）
+        // 比如 `*_storag` -> 提取出 `storag`
+        const typedTextMatch = searchPart.match(/[^*?]+$/);
+        const typedText = typedTextMatch ? typedTextMatch[0] : "";
+        const typedLower = typedText.toLowerCase();
+
+        // 6. 过滤有效文件项并提取候选后缀
+        // 排除掉没有 fileType 的纯文本装饰项 (如 Create, Info 等)
+        const validItems = this.current.items.filter(item =>
+            item.fileType !== undefined && item.name
+        );
+
+        if (validItems.length === 0) return;
+
+        const suffixes: { text: string, isDir: boolean }[] = [];
+
+        for (const item of validItems) {
+            // 仅使用 basename 来补全当前层级，打破 bulk op 中深层路径的干扰
+            const basename = OSPath.basename(item.name);
+            // 找到用户输入字符在文件名中的位置
+            const idx = typedLower === "" ? 0 : basename.toLowerCase().lastIndexOf(typedLower);
+            if (idx !== -1) {
+                suffixes.push({
+                    text: basename.substring(idx),
+                    isDir: !!(item.fileType !== undefined && item.fileType & FileType.Directory)
+                });
+            }
+        }
+
+        if (suffixes.length === 0) return;
+
+        // 7. 计算候选后缀的最长公共前缀 (LCP, Longest Common Prefix)
+        // 支持大小写不敏感匹配，并在大小写产生分歧时保留用户的输入习惯
+        let lcp = "";
+        let j = 0;
+        while (true) {
+            if (j >= suffixes[0].text.length) break;
+            const charLower = suffixes[0].text[j].toLowerCase();
+            const charStrict = suffixes[0].text[j];
+            let allMatchLower = true;
+            let allMatchStrict = true;
+
+            for (let i = 1; i < suffixes.length; i++) {
+                if (j >= suffixes[i].text.length) {
+                    allMatchLower = false;
+                    break;
+                }
+                if (suffixes[i].text[j].toLowerCase() !== charLower) {
+                    allMatchLower = false;
+                    break;
+                }
+                if (suffixes[i].text[j] !== charStrict) {
+                    allMatchStrict = false;
+                }
+            }
+
+            if (!allMatchLower) break; // 如果连忽略大小写都无法匹配，中止
+
+            if (allMatchStrict) {
+                // 大小写完美一致，直接采用系统文件的真实字符
+                lcp += charStrict;
+            } else {
+                // 出现大小写分歧：如果属于用户敲击的范围，保留用户的习惯；否则退化为小写或文件本来字符
+                if (j < typedText.length) {
+                    lcp += typedText[j];
+                } else {
+                    lcp += charLower;
+                }
+            }
+            j++;
+        }
+
+        // 8. 构建新的补全后缀
+        let newSuffix = lcp;
+        // 如果只有一个候选匹配，且它是目录，在末尾追加 `/` 方便下钻
+        if (suffixes.length === 1 && suffixes[0].text === lcp && suffixes[0].isDir) {
+            newSuffix += '/';
+        }
+
+        // 9. 拼装最新的输入框文本
+        // tokenPrefix: 前面按空格分割留下的参数 (e.g. `r:*.js `)
+        // val.substring(...) - tokenPrefix: 定位到最后被操作的字串，并截掉原本的 typedText，替换为 LCP
+        const newValue = val.substring(0, val.length - typedText.length) + newSuffix;
+
+        if (this.current.value !== newValue) {
+            this.current.value = newValue;
+        }
     }
 }
 
@@ -1447,8 +1537,10 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(vscode.commands.registerCommand("file-browser.stepIn", () => active.ifSome(a => a.stepIn())));
     context.subscriptions.push(vscode.commands.registerCommand("file-browser.stepOut", () => active.ifSome(a => a.stepOut())));
     context.subscriptions.push(vscode.commands.registerCommand("file-browser.actions", () => active.ifSome(a => a.actions())));
-    context.subscriptions.push(vscode.commands.registerCommand("file-browser.tabNext", () => active.ifSome(a => a.tabCompletion(true))));
-    context.subscriptions.push(vscode.commands.registerCommand("file-browser.tabPrev", () => active.ifSome(a => a.tabCompletion(false))));
+
+    // 覆盖旧的 Tab 命令：无论执行哪个都触发标准化的智能补全
+    context.subscriptions.push(vscode.commands.registerCommand("file-browser.tabNext", () => active.ifSome(a => a.tabCompletion())));
+    context.subscriptions.push(vscode.commands.registerCommand("file-browser.tabPrev", () => active.ifSome(a => a.tabCompletion())));
 }
 
 export function deactivate() { }
