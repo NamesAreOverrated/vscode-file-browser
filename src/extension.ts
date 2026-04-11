@@ -679,7 +679,7 @@ class FileBrowser {
 
             }
             if (this.searchToken !== token) return;
-            this.current.items = results.length > 0 ? results : [{ label: "No matching text found.", name: "", alwaysShow: true } as FileItem];
+            this.current.items = results.length > 0 ? results : [{ label: "No matching text found in the first 250 files.", name: "", alwaysShow: true } as FileItem];
         } catch (e) { } finally { if (this.searchToken === token) this.current.busy = false; }
     }
 
