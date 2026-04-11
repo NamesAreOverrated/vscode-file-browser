@@ -211,7 +211,13 @@ export async function expandPaths(
                     try {
                         const entries = await vscode.workspace.fs.readDirectory(cur.uri);
                         for (const [n, t] of entries) {
-                            const isDir = !!(t & FileType.Directory);
+                            let isDir = !!(t & FileType.Directory);
+                            if (t === FileType.SymbolicLink) {
+                                try {
+                                    const linkStat = await vscode.workspace.fs.stat(Uri.joinPath(cur.uri, n));
+                                    isDir = !!(linkStat.type & FileType.Directory);
+                                } catch { }
+                            }
                             const patternStr = seg.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.');
                             const regex = fuzzy ? new RegExp(`.*${patternStr}.*`, 'i') : new RegExp(`^${patternStr}$`);
 
@@ -583,11 +589,16 @@ class FileBrowser {
 
     async stepOut() {
         if (this.stateStack.length > 0) { await this.popState(); return; }
-        const folders = vscode.workspace.workspaceFolders;
-        if (folders && folders.some(f => f.uri.fsPath === this.path.uri.fsPath)) {
-            vscode.window.showInformationMessage("You are at the root of the workspace."); return;
-        }
+
         if (!this.path.atTop()) {
+            const parentPath = this.path.clone();
+            parentPath.pop();
+            // 如果跳出工作区不安全，阻止跳出并提示
+            if (!isPathSafe(parentPath.uri)) {
+                vscode.window.showInformationMessage("Cannot step out: Outside of workspace bounds.");
+                return;
+            }
+
             this.pathHistory[this.path.id] = this.activeItem().map((item) => item.name);
             this.file = this.path.pop(); this.inActions = false; await this.update();
         }
@@ -832,7 +843,7 @@ class FileBrowser {
                     payload: m.uri
                 } as FileItem);
             }
-            for (const p of finalCreatePaths) { items.push({ label: p.isDir ? `$(add) [Folder] ${p.name}/` : `$(add) ${p.name}`, name: p.name, description: "Preview (Click to create single item)", alwaysShow: true, action: Action.SingleCreate, payload: p } as FileItem); }
+            for (const p of finalCreatePaths) { items.push({ label: p.isDir ? `$(add) [Folder] ${p.name}` : `$(add) ${p.name}`, name: p.name, description: "Preview (Click to create single item)", alwaysShow: true, action: Action.SingleCreate, payload: p } as FileItem); }
             this.current.items = items; if (items.length > 0) this.current.activeItems = [items[0]];
         } catch (e) { } this.current.busy = false;
     }
@@ -893,10 +904,15 @@ class FileBrowser {
                 // 判断目标是否为目录 (斜杠结尾，或者在文件系统中确实是目录)
                 let isDestDir = toPattern.endsWith('/') || toPattern.endsWith('\\');
                 if (!isDestDir && toPattern !== '') {
-                    try {
-                        const stat = await vscode.workspace.fs.stat(Uri.joinPath(this.path.uri, toPattern));
-                        if (stat.type & FileType.Directory) isDestDir = true;
-                    } catch { }
+                    // 💡 新增防呆逻辑：如果源文件超过1个且目标没有通配符，它必定是一个目录
+                    if (resolvedSources.length > 1 && !toPattern.includes('*')) {
+                        isDestDir = true;
+                    } else {
+                        try {
+                            const stat = await vscode.workspace.fs.stat(Uri.joinPath(this.path.uri, toPattern));
+                            if (stat.type & FileType.Directory) isDestDir = true;
+                        } catch { }
+                    }
                 }
 
                 const toDir = isDestDir ? toPattern : OSPath.dirname(toPattern);
@@ -1096,7 +1112,13 @@ class FileBrowser {
                     for (const p of paths) {
                         ensureSafe(p.uri);
                         await vscode.workspace.fs.createDirectory(Uri.joinPath(p.uri, '..'));
-                        if (p.isDir) await vscode.workspace.fs.createDirectory(p.uri);
+                        if (p.isDir) {
+                            try {
+                                await vscode.workspace.fs.createDirectory(p.uri);
+                            } catch (err: any) {
+                                vscode.window.showWarningMessage(`Cannot create directory ${p.uri}: File already exists.`);
+                            }
+                        }
                         else { try { await vscode.workspace.fs.stat(p.uri); } catch { await vscode.workspace.fs.writeFile(p.uri, new Uint8Array(0)); } }
                     }
                     await this.update(); break;
