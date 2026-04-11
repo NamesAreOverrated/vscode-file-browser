@@ -19,15 +19,14 @@ function isPathSafe(uri: Uri): boolean {
     const folders = vscode.workspace.workspaceFolders;
     if (!folders || folders.length === 0) return true;
 
-    // 检查该 URI 是否属于任何一个工作区文件夹
     const folder = vscode.workspace.getWorkspaceFolder(uri);
     if (folder) return true;
 
-    // 备选方案：通过 fsPath 字符串前缀比对（处理符号链接等复杂情况）
-    const targetPath = OSPath.normalize(uri.fsPath).toLowerCase();
+    const targetPath = OSPath.normalize(uri.fsPath);
     return folders.some(f => {
-        const rootPath = OSPath.normalize(f.uri.fsPath).toLowerCase();
-        return targetPath.startsWith(rootPath);
+        const rootPath = OSPath.normalize(f.uri.fsPath);
+        const rel = OSPath.relative(rootPath, targetPath);
+        return !rel.startsWith('..') && !OSPath.isAbsolute(rel);
     });
 }
 
@@ -661,7 +660,7 @@ class FileBrowser {
                     }
                 }
             } else {
-                const files = await vscode.workspace.findFiles('**/*', '{**/node_modules/**,**/.git/**,**/dist/**,**/build/**}', 250);
+                const files = await vscode.workspace.findFiles('**/*', '{**/node_modules/**, **/.git/**, **/dist/**, **/build/**, **/*.map, **/*.min.js}', 250);
                 if (this.searchToken !== token) return;
                 const decoder = new TextDecoder('utf-8'); const batchSize = 10;
                 for (let i = 0; i < files.length; i += batchSize) {
@@ -677,6 +676,7 @@ class FileBrowser {
                         } catch (e) { }
                     }));
                 }
+
             }
             if (this.searchToken !== token) return;
             this.current.items = results.length > 0 ? results : [{ label: "No matching text found.", name: "", alwaysShow: true } as FileItem];
@@ -858,9 +858,11 @@ class FileBrowser {
         }
         if (this.searchToken !== token) return;
         const sourceUrisSet = new Set(resolvedSources.map(p => p.uri.toString()));
+        const isEditorInCurrentDir = this.editorUri &&
+            (OSPath.dirname(this.editorUri.fsPath) === OSPath.normalize(this.path.uri.fsPath));
 
         // --- 1. 编辑器单文件快速操作 (便捷逻辑) ---
-        if (isSingleArg && this.editorUri && matchPattern && matchPattern && action !== Action.BulkDelete) {
+        if (isSingleArg && isEditorInCurrentDir && this.editorUri && matchPattern && matchPattern && action !== Action.BulkDelete) {
             const oldUri = this.editorUri;
             const newUri = Uri.joinPath(oldUri, '..', matchPattern);
 
@@ -887,7 +889,6 @@ class FileBrowser {
             if ((action === Action.BulkCopy || action === Action.BulkMove || action === Action.BulkRename) && parts.length >= 2) {
                 const fromPattern = parts[0];
                 const toPattern = parts[1];
-                const isMove = action === Action.BulkMove || action === Action.BulkRename;
 
                 // 判断目标是否为目录 (斜杠结尾，或者在文件系统中确实是目录)
                 let isDestDir = toPattern.endsWith('/') || toPattern.endsWith('\\');
@@ -908,7 +909,10 @@ class FileBrowser {
                     const srcBase = OSPath.basename(src.name);
 
                     // 应用通配符 (例如 *.ts -> *.js)
-                    const newBase = applyWildcard(srcBase, fromName, toName) || (isDestDir ? srcBase : toName);
+                    const newBase = isDestDir
+                        ? srcBase
+                        : (applyWildcard(srcBase, fromName, toName) || toName);
+
 
                     let targetUri: Uri;
                     if (toDir === '.' && !toPattern.includes('/')) {
