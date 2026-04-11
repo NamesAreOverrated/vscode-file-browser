@@ -465,7 +465,12 @@ class FileBrowser {
             for (const tab of group.tabs) {
                 if (tab.input instanceof vscode.TabInputText) {
                     const uriStr = tab.input.uri.toString();
-                    if (this.urisToClose.has(uriStr)) { if (tab.isPreview) vscode.window.tabGroups.close(tab, true); this.urisToClose.delete(uriStr); }
+                    if (this.urisToClose.has(uriStr)) {
+                        if (tab.isPreview) {
+                            vscode.window.tabGroups.close(tab, true);
+                            this.urisToClose.delete(uriStr);
+                        }
+                    }
                 }
             }
         }
@@ -843,28 +848,10 @@ class FileBrowser {
         const matchPattern = parts.length > 0 ? parts[0] : "";
         const isSingleArg = parts.length === 1;
 
-        // --- 编辑器单文件快速操作 (便捷逻辑) ---
-        if (isSingleArg && this.editorUri && matchPattern) {
-            const oldUri = this.editorUri;
-            if (action === Action.BulkCopy || action === Action.BulkMove) {
-                const isMove = action === Action.BulkMove;
-                this.current.items = [{
-                    label: `$(files) ${isMove ? 'Move' : 'Copy'} current file to '${matchPattern}'`, name: matchPattern,
-                    alwaysShow: true, action: isMove ? Action.SingleMove : Action.SingleCopy,
-                    payload: { oldUri, newUri: Uri.joinPath(oldUri, '..', matchPattern) }
-                } as FileItem];
-                this.current.busy = false; return;
-            } else if (action === Action.BulkRename) {
-                this.current.items = [{
-                    label: `$(edit) Rename current file to '${matchPattern}'`, name: matchPattern,
-                    alwaysShow: true, action: Action.SingleRename,
-                    payload: { oldUri, newUri: Uri.joinPath(oldUri, '..', matchPattern) }
-                } as FileItem];
-                this.current.busy = false; return;
-            }
-        }
+        let exactMatchedItems: FileItem[] = [];
+        let finalItems: FileItem[] = [];
 
-        // --- 获取精准匹配结果 ---
+        // 获取精准匹配源数据
         let resolvedSources: { name: string, uri: Uri, type: FileType }[] = [];
         if (matchPattern) {
             try { resolvedSources = await resolveExistingPaths(this.path.uri, matchPattern, matchPattern.endsWith('/')); } catch (e) { }
@@ -872,123 +859,125 @@ class FileBrowser {
         if (this.searchToken !== token) return;
         const sourceUrisSet = new Set(resolvedSources.map(p => p.uri.toString()));
 
-        let finalItems: FileItem[] = [];
-        let label = ""; let payload: any = {};
-        let exactMatchedItems: FileItem[] = [];
+        // --- 1. 编辑器单文件快速操作 (便捷逻辑) ---
+        if (isSingleArg && this.editorUri && matchPattern && matchPattern && action !== Action.BulkDelete) {
+            const oldUri = this.editorUri;
+            const newUri = Uri.joinPath(oldUri, '..', matchPattern);
 
-        // --- 处理 Copy / Move 逻辑 ---
-        if (matchPattern && (action === Action.BulkCopy || action === Action.BulkMove) && parts.length >= 2) {
+            if (action === Action.BulkCopy || action === Action.BulkMove) {
+                const isMove = action === Action.BulkMove;
+                exactMatchedItems.push({
+                    label: `$(files) ${isMove ? 'Move' : 'Copy'} current file -> ${this.getRelativeDisplayPath(newUri)}`,
+                    name: matchPattern,
+                    alwaysShow: true, action: isMove ? Action.SingleMove : Action.SingleCopy,
+                    payload: { oldUri, newUri }
+                } as FileItem);
+            } else if (action === Action.BulkRename) {
+                exactMatchedItems.push({
+                    label: `$(edit) Rename current file -> ${this.getRelativeDisplayPath(newUri)}`,
+                    name: matchPattern,
+                    alwaysShow: true, action: Action.SingleRename,
+                    payload: { oldUri, newUri }
+                } as FileItem);
+            }
+        }
+        // --- 2. 正常 Bulk 操作 ---
+        else if (matchPattern) {
+            // 处理 Copy / Move / Rename 统一逻辑
+            if ((action === Action.BulkCopy || action === Action.BulkMove || action === Action.BulkRename) && parts.length >= 2) {
+                const fromPattern = parts[0];
+                const toPattern = parts[1];
+                const isMove = action === Action.BulkMove || action === Action.BulkRename;
 
-            const fromPattern = parts[0];
-            const toPattern = parts[1];
-            const isMove = action === Action.BulkMove;
+                // 判断目标是否为目录 (斜杠结尾，或者在文件系统中确实是目录)
+                let isDestDir = toPattern.endsWith('/') || toPattern.endsWith('\\');
+                if (!isDestDir && toPattern !== '') {
+                    try {
+                        const stat = await vscode.workspace.fs.stat(Uri.joinPath(this.path.uri, toPattern));
+                        if (stat.type & FileType.Directory) isDestDir = true;
+                    } catch { }
+                }
 
-            let sources: ExpandedPath[] = [];
-            let dests: ExpandedPath[] = [];
+                const toDir = isDestDir ? toPattern : OSPath.dirname(toPattern);
+                const toName = isDestDir ? '*' : OSPath.basename(toPattern);
+                const fromName = OSPath.basename(fromPattern);
 
-            try {
-                sources = await expandPaths(this.path.uri, fromPattern, {
-                    onlyExisting: true
-                });
+                const mappings: { src: { name: string, uri: Uri }, target: Uri }[] = [];
 
-                dests = await expandPaths(this.path.uri, toPattern, {
-                    onlyExisting: false
-                });
-            } catch { }
-
-            if (this.searchToken !== token) return;
-
-            const mappings: { src: ExpandedPath, target: Uri }[] = [];
-
-            for (const src of sources) {
-                for (const dest of dests) {
-
-                    let target: Uri;
-
+                for (const src of resolvedSources) {
                     const srcBase = OSPath.basename(src.name);
 
-                    // 👉 判断 dest 是目录还是 pattern
-                    const isDestDir =
-                        dest.isDir ||
-                        toPattern.endsWith('/') ||
-                        toPattern.endsWith('\\');
+                    // 应用通配符 (例如 *.ts -> *.js)
+                    const newBase = applyWildcard(srcBase, fromName, toName) || (isDestDir ? srcBase : toName);
 
-                    if (isDestDir) {
-                        // 📁 目录模式
-                        target = Uri.joinPath(dest.uri, srcBase);
+                    let targetUri: Uri;
+                    if (toDir === '.' && !toPattern.includes('/')) {
+                        // 如果目标没有指定额外路径，则保留在源文件同级目录
+                        targetUri = Uri.joinPath(src.uri, '..', newBase);
                     } else {
-                        // 🔁 pattern rename
-                        const newBase = applyWildcard(
-                            srcBase,
-                            OSPath.basename(fromPattern),
-                            OSPath.basename(toPattern)
-                        ) || srcBase;
-
-                        target = Uri.joinPath(dest.uri, '..', newBase);
+                        // 否则基于当前工作目录拼接
+                        targetUri = Uri.joinPath(this.path.uri, toDir, newBase);
                     }
-
-                    mappings.push({ src, target });
+                    mappings.push({ src, target: targetUri });
                 }
+
+                const opName = action === Action.BulkRename ? "Rename" : action === Action.BulkMove ? "Move" : "Copy";
+                const opIcon = action === Action.BulkRename ? "$(edit)" : "$(zap)";
+
+                // 顶部执行项
+                if (mappings.length > 0) {
+                    finalItems.push({
+                        label: `${opIcon} ${opName} ${mappings.length} items`,
+                        name: fullQuery,
+                        alwaysShow: true,
+                        action: action,
+                        payload: { mappings }
+                    } as FileItem);
+                }
+
+                // 列表预览项
+                for (const m of mappings) {
+                    exactMatchedItems.push({
+                        label: `$(arrow-right) ${m.src.name} -> ${this.getRelativeDisplayPath(m.target)}`,
+                        name: m.src.name,
+                        alwaysShow: true,
+                        action: action === Action.BulkCopy ? Action.SingleCopy : (action === Action.BulkMove ? Action.SingleMove : Action.SingleRename),
+                        payload: {
+                            oldUri: m.src.uri,
+                            newUri: m.target
+                        }
+                    } as FileItem);
+                }
+
             }
-
-            // --- Preview items ---
-            const previewItems: FileItem[] = mappings.map(m => ({
-                label: `$(arrow-right) ${m.src.name} → ${vscode.workspace.asRelativePath(m.target)}`,
-                name: m.src.name,
-                alwaysShow: true,
-                action: isMove ? Action.SingleMove : Action.SingleCopy,
-                payload: {
-                    oldUri: m.src.uri,
-                    newUri: m.target
+            // 处理 Delete 逻辑
+            else if (action === Action.BulkDelete) {
+                const label = matchPattern ? `Delete matching '${matchPattern}' (${resolvedSources.length} items)` : `Type pattern to delete...`;
+                if (resolvedSources.length > 0) {
+                    finalItems.push({
+                        label: `$(trash) ${label}`,
+                        name: fullQuery,
+                        alwaysShow: true,
+                        action,
+                        payload: { uris: resolvedSources.map(r => r.uri) }
+                    } as FileItem);
                 }
-            }));
-
-            // --- 顶部执行项 ---
-            finalItems.push({
-                label: `$(zap) ${isMove ? 'Move' : 'Copy'} ${mappings.length} items`,
-                name: fullQuery,
-                alwaysShow: true,
-                action,
-                payload: {
-                    mappings
-                }
-            } as FileItem);
-
-            finalItems.push(...previewItems);
-
-        } else if (matchPattern && action === Action.BulkRename && parts.length >= 2) {
-            const from = parts[0], to = parts[1];
-            label = `Rename matching '${from}' to '${to}'`;
-            payload = { from, to };
-            exactMatchedItems = resolvedSources.map(p => {
-                const oldBase = OSPath.basename(p.name);
-                const newBase = applyWildcard(oldBase, OSPath.basename(from), OSPath.basename(to)) || oldBase;
-                const newUri = Uri.joinPath(p.uri, '..', newBase);
-                return {
-                    label: `$(arrow-right) ${p.name} -> ${newBase}`,
-                    name: p.name, alwaysShow: true, action: Action.SingleRename, payload: { oldUri: p.uri, newUri: newUri }
-                } as FileItem;
-            });
-        } else if (action === Action.BulkDelete) {
-            label = matchPattern ? `Delete matching '${matchPattern}' (${resolvedSources.length} items)` : `Type pattern to delete...`;
-            payload = { match: matchPattern };
-            exactMatchedItems = resolvedSources.map(p => ({
-                label: `$(trash) ${p.name} (Ready to delete)`,
-                name: p.name, alwaysShow: true, action: Action.SingleDelete, payload: { uri: p.uri }
-            } as FileItem));
+                exactMatchedItems = resolvedSources.map(p => ({
+                    label: `$(trash) ${p.name} (Ready to delete)`,
+                    name: p.name, alwaysShow: true, action: Action.SingleDelete, payload: { uri: p.uri }
+                } as FileItem));
+            }
         }
 
-        // --- 构建最终列表 ---
-        if (matchPattern && resolvedSources.length > 0 && Object.keys(payload).length > 0) {
-            finalItems.push({ label: `$(zap) ${label}`, name: fullQuery, alwaysShow: true, action, payload } as FileItem);
-        } else {
+        // --- 补充提示与合并 ---
+        if (finalItems.length === 0 && exactMatchedItems.length === 0) {
             const opName = action === Action.BulkRename ? "Rename" : action === Action.BulkCopy ? "Copy" : action === Action.BulkMove ? "Move" : "Delete";
             finalItems.push({ label: `$(info) Bulk ${opName}: type pattern...`, name: fullQuery, alwaysShow: true } as FileItem);
         }
 
         finalItems.push(...exactMatchedItems);
 
-        // 上下文提示
+        // --- 3. Context / Unmatched 模糊提示 ---
         try {
             const fuzzyResults = await searchExistingPaths(this.path.uri, matchPattern || "./");
             const contextItems = fuzzyResults.filter(m => !sourceUrisSet.has(m.uri.toString())).slice(0, 30).map(m => ({
@@ -1108,48 +1097,42 @@ class FileBrowser {
                     }
                     await this.update(); break;
                 }
-                case Action.BulkRename: {
-                    const { from, to } = item.payload;
-                    const resolved = await resolveExistingPaths(this.path.uri, from);
-                    if (resolved.length === 0 || !await this.confirmAction(`Rename ${resolved.length} items?`)) return;
-                    for (const r of resolved) {
-                        const newBase = applyWildcard(OSPath.basename(r.name), OSPath.basename(from), OSPath.basename(to)) || OSPath.basename(r.name);
-                        const newUri = Uri.joinPath(r.uri, '..', newBase);
-                        ensureSafe(newUri);
-                        try { await vscode.workspace.fs.rename(r.uri, newUri); } catch { }
+
+                case Action.BulkDelete: {
+                    const { uris } = item.payload as { uris: Uri[] };
+                    if (!uris || uris.length === 0 || !await this.confirmAction(`Delete ${uris.length} items?`, undefined, true)) return;
+
+                    for (const uri of uris) {
+                        ensureSafe(uri);
+                        await vscode.workspace.fs.delete(uri, { recursive: true, useTrash: true });
                     }
                     await this.update(); break;
                 }
-                case Action.BulkDelete: {
-                    const { match } = item.payload;
-                    const resolved = await resolveExistingPaths(this.path.uri, match);
-                    if (resolved.length === 0 || !await this.confirmAction(`Delete ${resolved.length} items?`, undefined, true)) return;
-                    for (const r of resolved) { ensureSafe(r.uri); await vscode.workspace.fs.delete(r.uri, { recursive: true, useTrash: true }); }
-                    await this.update(); break;
-                }
+                case Action.BulkRename:
                 case Action.BulkMove:
                 case Action.BulkCopy: {
-                    const isMove = item.action === Action.BulkMove;
+                    const isCopy = item.action === Action.BulkCopy;
+                    const opName = item.action === Action.BulkRename ? "Rename" : item.action === Action.BulkMove ? "Move" : "Copy";
+
                     const { mappings } = item.payload as {
-                        mappings: { src: ExpandedPath, target: Uri }[]
+                        mappings: { src: { name: string, uri: Uri }, target: Uri }[]
                     };
 
                     if (!mappings || mappings.length === 0) return;
 
-                    if (!await this.confirmAction(`${isMove ? 'Move' : 'Copy'} ${mappings.length} items?`)) return;
+                    if (!await this.confirmAction(`${opName} ${mappings.length} items?`)) return;
 
                     for (const m of mappings) {
                         const { src, target } = m;
 
                         ensureSafe(target);
-
                         await vscode.workspace.fs.createDirectory(Uri.joinPath(target, '..'));
 
                         try {
-                            if (isMove) {
-                                await vscode.workspace.fs.rename(src.uri, target, { overwrite: false });
-                            } else {
+                            if (isCopy) {
                                 await vscode.workspace.fs.copy(src.uri, target, { overwrite: false });
+                            } else {
+                                await vscode.workspace.fs.rename(src.uri, target, { overwrite: false });
                             }
                         } catch { }
                     }
