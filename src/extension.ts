@@ -1187,20 +1187,39 @@ class FileBrowser {
         const typedTextMatch = searchPart.match(/[^*?]+$/);
         const typedText = typedTextMatch ? typedTextMatch[0] : "";
         const typedLower = typedText.toLowerCase();
-        const validItems = this.current.items.filter(item => item.fileType !== undefined && item.name);
+
+        const validItems = this.current.items.filter(item =>
+            item.fileType !== undefined &&
+            item.name &&
+            item.action === undefined
+        );
+
         if (validItems.length === 0) return;
+
         const candidates: { text: string, isDir: boolean }[] = [];
         for (const item of validItems) {
             const basename = OSPath.basename(item.name);
-            const idx = typedLower === "" ? 0 : basename.toLowerCase().indexOf(typedLower);
-            if (idx !== -1) { candidates.push({ text: basename.substring(idx), isDir: !!(item.fileType !== undefined && item.fileType & FileType.Directory) }); }
+            const basenameLower = basename.toLowerCase();
+
+            if (typedLower === "" || basenameLower.startsWith(typedLower)) {
+                candidates.push({
+                    text: basename,
+                    isDir: !!(item.fileType !== undefined && item.fileType & FileType.Directory)
+                });
+            }
         }
+
         if (candidates.length === 0) return;
-        let lcp = ""; let j = 0;
+
+        // 计算最长公共前缀 (LCP)
+        let lcp = "";
+        let j = 0;
         while (true) {
             if (j >= candidates[0].text.length) break;
-            const charStrict = candidates[0].text[j]; const charLower = charStrict.toLowerCase();
-            let allMatchLower = true; let allMatchStrict = true;
+            const charStrict = candidates[0].text[j];
+            const charLower = charStrict.toLowerCase();
+            let allMatchLower = true;
+            let allMatchStrict = true;
             for (let i = 1; i < candidates.length; i++) {
                 if (j >= candidates[i].text.length) { allMatchLower = false; break; }
                 const compareChar = candidates[i].text[j];
@@ -1208,12 +1227,21 @@ class FileBrowser {
                 if (compareChar !== charStrict) allMatchStrict = false;
             }
             if (!allMatchLower) break;
-            lcp += charStrict; j++;
+            lcp += charStrict;
+            j++;
         }
+
         let newSuffix = lcp;
-        if (candidates.length === 1 && candidates[0].text === lcp && candidates[0].isDir) newSuffix += '/';
+        // 如果仅匹配到一个且为目录，自动补全末尾的斜杠 /
+        if (candidates.length === 1 && candidates[0].text === lcp && candidates[0].isDir) {
+            newSuffix += '/';
+        }
+
+        // 替换光标前的输入文本
         const newValue = val.substring(0, val.length - typedText.length) + newSuffix;
-        if (this.current.value !== newValue) this.current.value = newValue;
+        if (this.current.value !== newValue) {
+            this.current.value = newValue;
+        }
     }
 }
 
