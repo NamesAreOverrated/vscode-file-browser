@@ -92,20 +92,22 @@ function splitArgs(str: string): string[] {
     return result;
 }
 
-function applyWildcard(name: string, fromPattern: string, toPattern: string): string | null {
-    if (!toPattern.includes('*')) return toPattern;
-
-    // 将 glob 转换为正则表达式，捕获 * 部分
-    const escapedFrom = fromPattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '(.*)');
-    const regex = new RegExp(`^${escapedFrom}$`);
+function applyWildcard(name: string, from: string, to: string): string | null {
+    if (!from.includes('*')) return name === from ? to : null;
+    const escapedFrom = from.replace(/[.+?^${}()|[\]\\]/g, '\\$&');
+    const regexStr = '^' + escapedFrom.replace(/\*/g, '(.*)') + '$';
+    const regex = new RegExp(regexStr);
     const match = name.match(regex);
-
     if (!match) return null;
 
-    let result = toPattern;
-    // 依次替换 toPattern 中的 *
-    for (let i = 1; i < match.length; i++) {
-        result = result.replace('*', match[i]);
+    let result = '';
+    let groupIndex = 1;
+    for (let i = 0; i < to.length; i++) {
+        if (to[i] === '*') {
+            if (groupIndex < match.length) result += match[groupIndex++];
+        } else {
+            result += to[i];
+        }
     }
     return result;
 }
