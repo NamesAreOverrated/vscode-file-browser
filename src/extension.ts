@@ -1,3 +1,4 @@
+
 import * as vscode from "vscode";
 import { Uri, FileType, QuickInputButton, ThemeIcon, ViewColumn, DocumentSymbol } from "vscode";
 import * as OS from "os";
@@ -315,7 +316,9 @@ export async function expandPaths(
     }
 
     return results;
-} export async function resolveExistingPaths(baseUri: Uri, pattern: string, onlyDirs: boolean = false): Promise<{ name: string, uri: Uri, type: FileType }[]> {
+}
+
+export async function resolveExistingPaths(baseUri: Uri, pattern: string, onlyDirs: boolean = false): Promise<{ name: string, uri: Uri, type: FileType }[]> {
     const res = await expandPaths(baseUri, pattern, {
         onlyExisting: true,
         onlyDirs,
@@ -399,7 +402,13 @@ class FileBrowser {
     private searchToken = 0;
     private searchTimeout?: NodeJS.Timeout;
 
+    // 光标防乱跑：记录初始状态
+    private originalSelection?: vscode.Selection;
+    private originalVisibleRanges?: readonly vscode.Range[];
+    private accepted: boolean = false;
+
     actionsButton: QuickInputButton = { iconPath: new ThemeIcon("ellipsis"), tooltip: "Actions on selected file" };
+    terminalButton: QuickInputButton = { iconPath: new ThemeIcon("terminal"), tooltip: "Open terminal in current folder" }; // 新增：终端按钮
     stepOutButton: QuickInputButton = { iconPath: new ThemeIcon("arrow-left"), tooltip: "Step out of folder" };
     stepInButton: QuickInputButton = { iconPath: new ThemeIcon("arrow-right"), tooltip: "Step into folder" };
 
@@ -407,11 +416,18 @@ class FileBrowser {
         this.path = path;
         this.file = file;
         this.pathHistory = { [this.path.id]: this.file };
+
+        // 记录光标初始状态，方便取消搜索时还原
         const editor = vscode.window.activeTextEditor;
-        if (editor) this.editorUri = editor.document.uri;
+        if (editor) {
+            this.editorUri = editor.document.uri;
+            this.originalSelection = editor.selection;
+            this.originalVisibleRanges = editor.visibleRanges;
+        }
 
         this.current = vscode.window.createQuickPick();
-        this.current.buttons = [this.actionsButton, this.stepOutButton, this.stepInButton];
+        // 将 terminal 按钮放到顶部栏中
+        this.current.buttons = [this.actionsButton, this.terminalButton, this.stepOutButton, this.stepInButton];
         this.current.placeholder = "Preparing the file list...";
         this.current.onDidHide(() => { if (!this.keepAlive) this.dispose(); });
         this.current.onDidAccept(this.onDidAccept.bind(this));
@@ -426,6 +442,7 @@ class FileBrowser {
 
     private previewTimeout?: NodeJS.Timeout;
     private urisToClose = new Set<string>();
+
     private async preview(item: FileItem) {
         if (this.inActions) return;
         if (this.previewTimeout) { clearTimeout(this.previewTimeout); this.previewTimeout = undefined; }
@@ -487,12 +504,9 @@ class FileBrowser {
         });
     }
     private getRelativeDisplayPath(uri: Uri): string {
-        // 计算相对于当前 browser 所在的 this.path 的路径
         let rel = OSPath.relative(this.path.uri.fsPath, uri.fsPath);
         if (!rel) return ".";
-        // 统一使用正斜杠
         rel = rel.replace(/\\/g, '/');
-        // 如果是在当前目录下的文件，去掉 ./ 
         if (rel.startsWith('./')) rel = rel.substring(2);
         return rel;
     }
@@ -522,7 +536,25 @@ class FileBrowser {
         else { this.items = prevState.cachedItems; this.current.items = this.items; prevState.file.ifSome(f => { this.current.activeItems = this.items.filter(i => i.name === f); }); }
     }
 
-    dispose() { this.closePreviewTab(); this.clearDecorations(); setContext(false); this.current.dispose(); active = None; }
+    dispose() {
+        this.closePreviewTab();
+        this.clearDecorations();
+
+        // 核心修复：如果用户未确认打开且当前有暂存的原始状态，把光标和滚动位置还原
+        if (!this.accepted && this.editorUri && this.originalSelection) {
+            const editor = vscode.window.visibleTextEditors.find(e => e.document.uri.toString() === this.editorUri!.toString());
+            if (editor) {
+                editor.selection = this.originalSelection;
+                if (this.originalVisibleRanges && this.originalVisibleRanges.length > 0) {
+                    editor.revealRange(this.originalVisibleRanges[0], vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+                }
+            }
+        }
+
+        setContext(false);
+        this.current.dispose();
+        active = None;
+    }
     hide() { this.current.hide(); setContext(false); }
     show() { setContext(true); this.current.show(); }
     activeItem(): Option<FileItem> { return Option.from(this.current.activeItems[0]); }
@@ -531,6 +563,7 @@ class FileBrowser {
         if (button === this.stepInButton) this.stepIn();
         else if (button === this.stepOutButton) this.stepOut();
         else if (button === this.actionsButton) this.actions();
+        else if (button === this.terminalButton) this.openTerminal(); // 触发终端命令
     }
 
     async update() {
@@ -550,6 +583,7 @@ class FileBrowser {
             this.items = [
                 action("$(folder-opened) Open this folder", Action.OpenFolder),
                 action("$(folder-opened) Open this folder in a new window", Action.OpenFolderInNewWindow),
+                action("$(terminal) Open terminal here", Action.OpenTerminal as any), // 触发终端 Action
                 action("$(edit) Rename this folder", Action.RenameFile),
                 action("$(trash) Delete this folder", Action.DeleteFile),
             ];
@@ -1018,6 +1052,7 @@ class FileBrowser {
     // ================= 文件操作执行 =================
 
     openFile(uri: Uri, column?: ViewColumn, range?: vscode.Range, selectionRange?: vscode.Range) {
+        this.accepted = true; // 🎯核心修改：用户确认跳转，此时不再恢复原光标
         if (this.previewTimeout) { clearTimeout(this.previewTimeout); this.previewTimeout = undefined; }
         this.clearDecorations();
         let targetColumn = column;
@@ -1037,6 +1072,17 @@ class FileBrowser {
                 if (range) { const ts = selectionRange || range; editor.selection = new vscode.Selection(ts.start, ts.end); editor.revealRange(range, vscode.TextEditorRevealType.InCenter); }
             });
         });
+    }
+
+    // 新增：打开终端方法
+    openTerminal() {
+        const terminal = vscode.window.createTerminal({
+            cwd: this.path.uri,
+            name: `Terminal: ${OSPath.basename(this.path.uri.fsPath)}`
+        });
+        terminal.show();
+        this.accepted = true;
+        this.dispose();
     }
 
     private async confirmAction(message: string, detail?: string, isDestructive: boolean = false): Promise<boolean> {
@@ -1185,6 +1231,8 @@ class FileBrowser {
                     }
                     break;
                 }
+                // 处理在文件夹上点击的 Action 
+                case (Action as any).OpenTerminal: { this.openTerminal(); break; } // 在 actions 菜单内使用
                 case Action.RenameFile: { this.keepAlive = true; this.hide(); await this.rename(); this.show(); this.keepAlive = false; await this.popState(); break; }
                 case Action.DeleteFile: { ensureSafe(this.path.uri); if (await this.confirmAction(`Delete?`, "Trash", true)) { await vscode.workspace.fs.delete(this.path.uri, { recursive: true, useTrash: true }); await this.popState(); } break; }
                 case Action.OpenFolder: { vscode.commands.executeCommand("vscode.openFolder", this.path.uri); break; }

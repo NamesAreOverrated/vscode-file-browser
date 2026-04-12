@@ -7,6 +7,7 @@ export enum Action {
     DeleteFile,
     OpenFolder,
     OpenFolderInNewWindow,
+    OpenTerminal,
 
     // ======== 批量/搜索 Action ========
     GoToLine,
@@ -21,7 +22,8 @@ export enum Action {
     SingleRename,
     SingleCopy,
     SingleMove,
-    SingleDelete
+    SingleDelete,
+
 }
 
 export function action(label: string, action: Action, payload?: any) {
