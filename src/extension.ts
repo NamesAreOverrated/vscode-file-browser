@@ -92,26 +92,23 @@ function splitArgs(str: string): string[] {
     return result;
 }
 
-function applyWildcard(name: string, from: string, to: string): string | null {
-    if (!from.includes('*')) return name === from ? to : null;
-    const escapedFrom = from.replace(/[.+?^${}()|[\]\\]/g, '\\$&');
-    const regexStr = '^' + escapedFrom.replace(/\*/g, '(.*)') + '$';
-    const regex = new RegExp(regexStr);
+function applyWildcard(name: string, fromPattern: string, toPattern: string): string | null {
+    if (!toPattern.includes('*')) return toPattern;
+
+    // 将 glob 转换为正则表达式，捕获 * 部分
+    const escapedFrom = fromPattern.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '(.*)');
+    const regex = new RegExp(`^${escapedFrom}$`);
     const match = name.match(regex);
+
     if (!match) return null;
 
-    let result = '';
-    let groupIndex = 1;
-    for (let i = 0; i < to.length; i++) {
-        if (to[i] === '*') {
-            if (groupIndex < match.length) result += match[groupIndex++];
-        } else {
-            result += to[i];
-        }
+    let result = toPattern;
+    // 依次替换 toPattern 中的 *
+    for (let i = 1; i < match.length; i++) {
+        result = result.replace('*', match[i]);
     }
     return result;
 }
-
 // ================= 路径解析逻辑 =================
 
 function expandBraces(str: string): string[] {
@@ -1049,6 +1046,8 @@ class FileBrowser {
         const parts = splitArgs(queryValue.trim());
         const matchPattern = parts.length > 0 ? parts[0] : "";
         const contextQuery = parts.length > 1 ? parts[parts.length - 1] : matchPattern;
+        const isSingleArg = parts.length === 1;
+
 
         let finalItems: FileItem[] = [];
         let mappings: { src: { name: string, uri: Uri }, target: Uri }[] = [];
@@ -1063,8 +1062,35 @@ class FileBrowser {
 
         if (this.searchToken !== token) return;
 
+
+        const isEditorInCurrentDir = this.editorUri &&
+            (OSPath.dirname(this.editorUri.fsPath) === OSPath.normalize(this.path.uri.fsPath));
+
+        // --- 1. 编辑器单文件快速操作 (便捷逻辑) ---
+        if (isSingleArg && isEditorInCurrentDir && this.editorUri && matchPattern && matchPattern && action !== Action.BulkDelete) {
+            const oldUri = this.editorUri;
+            const newUri = Uri.joinPath(oldUri, '..', matchPattern);
+
+            if (action === Action.BulkCopy || action === Action.BulkMove) {
+                const isMove = action === Action.BulkMove;
+                finalItems.push({
+                    label: `$(files) ${isMove ? 'Move' : 'Copy'} current file -> ${this.getRelativeDisplayPath(newUri)}`,
+                    name: matchPattern,
+                    alwaysShow: true, action: isMove ? Action.SingleMove : Action.SingleCopy,
+                    payload: { oldUri, newUri }
+                } as FileItem);
+            } else if (action === Action.BulkRename) {
+                finalItems.push({
+                    label: `$(edit) Rename current file -> ${this.getRelativeDisplayPath(newUri)}`,
+                    name: matchPattern,
+                    alwaysShow: true, action: Action.SingleRename,
+                    payload: { oldUri, newUri }
+                } as FileItem);
+            }
+        }
+
         // 2. 核心逻辑：根据参数数量和 Action 类型构建映射
-        if (matchPattern && (action === Action.BulkCopy || action === Action.BulkMove || action === Action.BulkRename)) {
+        else if (matchPattern && (action === Action.BulkCopy || action === Action.BulkMove || action === Action.BulkRename)) {
             const toPatternRaw = parts.length >= 2 ? parts[1] : "";
             const expandedTargets = toPatternRaw ? expandBraces(toPatternRaw) : [""];
 
@@ -1201,18 +1227,25 @@ class FileBrowser {
     /**
      * 辅助函数：智能解析目标 URI
      */
-    private resolveTargetUri(srcBaseName: string, targetInput: string, fromPattern: string): Uri {
+    private resolveTargetUri(srcRelPath: string, targetInput: string, fromPattern: string): Uri {
+        // 1. 如果目标明确是一个目录（以斜杠结尾或为 . ..）
         const isDestExplicitDir = targetInput.endsWith('/') || targetInput.endsWith('\\') || targetInput === '.' || targetInput === '..';
 
-        const toDir = isDestExplicitDir ? targetInput : OSPath.dirname(targetInput);
-        const toName = isDestExplicitDir ? '*' : OSPath.basename(targetInput);
-        const fromName = OSPath.basename(fromPattern);
+        if (isDestExplicitDir) {
+            // 目标是目录：保持原文件名，拼接到目标目录下
+            return Uri.joinPath(this.path.uri, targetInput, OSPath.basename(srcRelPath));
+        }
 
-        const finalBaseName = (toName === '*' || toName === '')
-            ? srcBaseName
-            : (applyWildcard(srcBaseName, fromName, toName) || toName);
+        // 2. 如果目标包含通配符，尝试模式替换
+        if (targetInput.includes('*')) {
+            const transformedName = applyWildcard(srcRelPath, fromPattern, targetInput);
+            if (transformedName) {
+                return Uri.joinPath(this.path.uri, transformedName);
+            }
+        }
 
-        return Uri.joinPath(this.path.uri, toDir, finalBaseName);
+        // 3. 普通重命名：直接连接（targetInput 可能是 "backup/newname.ts"）
+        return Uri.joinPath(this.path.uri, targetInput);
     }
 
     // ================= 文件操作执行 =================
