@@ -230,23 +230,7 @@ export async function expandPaths(
                                 });
                             }
 
-                            // 如果是模糊模式且是目录，则递归寻找更多匹配
-                            if (fuzzy && isDir) {
-                                const subWalk = async (u: Uri, rel: string, depth: number) => {
-                                    if (depth > maxDepth) return;
-                                    try {
-                                        const subEntries = await vscode.workspace.fs.readDirectory(u);
-                                        for (const [sn, st] of subEntries) {
-                                            const sIsDir = !!(st & FileType.Directory);
-                                            if (regex.test(sn)) {
-                                                next.push({ name: `${rel}/${sn}`, uri: Uri.joinPath(u, sn), isDir: sIsDir });
-                                            }
-                                            if (sIsDir) await subWalk(Uri.joinPath(u, sn), `${rel}/${sn}`, depth + 1);
-                                        }
-                                    } catch { }
-                                };
-                                await subWalk(Uri.joinPath(cur.uri, n), cur.name ? `${cur.name}/${n}` : n, 1);
-                            }
+
                         }
                     } catch { }
                     continue;
