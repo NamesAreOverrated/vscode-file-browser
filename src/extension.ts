@@ -358,6 +358,88 @@ export async function resolveCreationPaths(baseUri: Uri, pattern: string): Promi
     }));
 }
 
+/**
+ * 智能目录探测：
+ * 1. 优先物理扫描（expandPaths）：支持相对路径、空文件夹、通配符。
+ * 2. 备选全局索引（findFiles）：当物理扫描结果不足或需要跨 Workspace 搜索时触发。
+ */
+async function findDirectoriesSmart(baseUri: Uri, query: string, token: number, searchTokenRef: { value: number }): Promise<ExpandedPath[]> {
+    const results: ExpandedPath[] = [];
+    const seen = new Set<string>();
+
+    // 1. 如果 Query 为空，展示当前目录下的直接子文件夹 (第一层)
+    if (!query) {
+        try {
+            const entries = await vscode.workspace.fs.readDirectory(baseUri);
+            for (const [name, type] of entries) {
+                if (type & FileType.Directory) {
+                    const uri = Uri.joinPath(baseUri, name);
+                    results.push({
+                        name: name,
+                        uri: uri,
+                        exists: true,
+                        isDir: true,
+                        type: FileType.Directory
+                    });
+                    seen.add(uri.toString());
+                }
+            }
+        } catch (e) { }
+        return results;
+    }
+
+    // 2. 如果有 Query，执行物理模糊搜索
+    // 限制深度为 3，兼顾性能和直觉（通常用户想找的就在附近）
+    const localResults = await expandPaths(baseUri, query, {
+        onlyExisting: true,
+        onlyDirs: true,
+        fuzzy: true,
+        maxDepth: 3
+    });
+
+    if (searchTokenRef.value !== token) return [];
+
+    for (const r of localResults) {
+        results.push(r);
+        seen.add(r.uri.toString());
+    }
+
+    // 3. 如果结果太少，且不含路径符号，补充全局索引搜索
+    if (results.length < 5 && !query.includes('/') && !query.includes('.')) {
+        try {
+            const globPattern = toCaseInsensitiveGlob(query);
+            // 查找匹配 query 的路径，并取其目录
+            const globalFiles = await vscode.workspace.findFiles(`**/*${globPattern}*/**`, '**/node_modules/**', 50);
+
+            for (const f of globalFiles) {
+                if (searchTokenRef.value !== token) break;
+                // 向上寻找名字匹配的目录段
+                let currentUri = f;
+                while (currentUri.fsPath.length > (vscode.workspace.getWorkspaceFolder(f)?.uri.fsPath.length || 0)) {
+                    const dirUri = Uri.joinPath(currentUri, '..');
+                    const dirName = OSPath.basename(dirUri.fsPath);
+                    if (dirName.toLowerCase().includes(query.toLowerCase())) {
+                        const dirStr = dirUri.toString();
+                        if (!seen.has(dirStr)) {
+                            seen.add(dirStr);
+                            results.push({
+                                name: vscode.workspace.asRelativePath(dirUri),
+                                uri: dirUri,
+                                exists: true,
+                                isDir: true,
+                                type: FileType.Directory
+                            });
+                        }
+                    }
+                    currentUri = dirUri;
+                    if (results.length > 50) break;
+                }
+            }
+        } catch (e) { }
+    }
+
+    return results;
+}
 // ================= 配置与上下文 =================
 
 export enum ConfigItem {
@@ -666,6 +748,7 @@ class FileBrowser {
         if (value.startsWith(":")) return this.handleLineSearch(value.substring(1));
         if (value.startsWith("!")) return this.debounce(() => this.handleGlobalFileSearch(value.substring(1)));
         if (value.startsWith("#")) return this.debounce(() => this.handleGlobalFolderSearch(value.substring(1)));
+        if (value.startsWith(">t")) return this.debounce(() => this.handleTerminalCommand(value.substring(2)));
         if (value.match(/^[rdcm]:/)) {
             const m: { [k: string]: Action } = { 'r': Action.BulkRename, 'd': Action.BulkDelete, 'c': Action.BulkCopy, 'm': Action.BulkMove };
             return this.debounce(() => this.handleBulkOp(value, m[value[0]]));
@@ -837,19 +920,6 @@ class FileBrowser {
             });
         } catch (e) { } finally { if (this.searchToken === token) this.current.busy = false; }
     }
-
-    async handleGlobalFolderSearch(query: string) {
-        const token = ++this.searchToken; query = query.trim(); if (query.length < 1) { this.current.items = [{ label: "Type to search folders globally...", name: "", alwaysShow: true } as FileItem]; return; }
-        this.current.busy = true;
-        try {
-            const globPattern = toCaseInsensitiveGlob(query); const files = await vscode.workspace.findFiles(`**/*${globPattern}*/**`, '**/node_modules/**', 200);
-            if (this.searchToken !== token) return;
-            const dirSet = new Set<string>(); const dirs: Uri[] = [];
-            for (const f of files) { const dirUri = Uri.joinPath(f, '..'); if (!dirSet.has(dirUri.fsPath)) { dirSet.add(dirUri.fsPath); dirs.push(dirUri); } }
-            this.current.items = dirs.map(uri => ({ label: `$(folder) ${OSPath.basename(uri.fsPath)}`, description: vscode.workspace.asRelativePath(uri), name: OSPath.basename(uri.fsPath), alwaysShow: true, fileType: FileType.Directory, payload: uri } as FileItem));
-        } catch (e) { } finally { if (this.searchToken === token) this.current.busy = false; }
-    }
-
     async handleGlobAndCreateSearch(value: string) {
         const token = ++this.searchToken; this.current.busy = true;
         try {
@@ -880,6 +950,76 @@ class FileBrowser {
             for (const p of finalCreatePaths) { items.push({ label: p.isDir ? `$(add) [Folder] ${p.name}` : `$(add) ${p.name}`, name: p.name, description: "Preview (Click to create single item)", alwaysShow: true, action: Action.SingleCreate, payload: p } as FileItem); }
             this.current.items = items; if (items.length > 0) this.current.activeItems = [items[0]];
         } catch (e) { } this.current.busy = false;
+    }
+
+    async handleGlobalFolderSearch(query: string) {
+        const token = ++this.searchToken;
+        const queryTrim = query.trim(); // 保持为空，如果用户没输入
+        this.current.busy = true;
+
+        try {
+            // 直接传入 queryTrim，如果为空，findDirectoriesSmart 会返回第一层子目录
+            const results = await findDirectoriesSmart(this.path.uri, queryTrim, token, { value: this.searchToken });
+            if (this.searchToken !== token) return;
+
+            this.current.items = results.map(r => ({
+                label: `$(folder) ${r.name}`,
+                description: vscode.workspace.asRelativePath(r.uri),
+                name: r.name,
+                alwaysShow: true,
+                fileType: FileType.Directory,
+                payload: r.uri
+            } as FileItem));
+
+            if (this.current.items.length === 0 && queryTrim) {
+                this.current.items = [{ label: `$(info) No folders found matching "${queryTrim}"`, name: "", alwaysShow: true } as FileItem];
+            }
+        } finally {
+            if (this.searchToken === token) this.current.busy = false;
+        }
+
+    }
+    async handleTerminalCommand(query: string) {
+        const token = ++this.searchToken;
+        const queryTrim = query.trim();
+        this.current.busy = true;
+
+        const items: FileItem[] = [];
+
+        // 固定项：在当前文件夹打开
+        items.push({
+            label: `$(terminal) Open Terminal in Current Folder`,
+            description: `./ (${this.path.fsPath})`,
+            name: ">t",
+            alwaysShow: true,
+            action: Action.OpenTerminal as any,
+            payload: { uri: this.path.uri }
+        } as FileItem);
+
+        try {
+            // 获取智能建议（空 query 时返回第一层子文件夹）
+            const dirs = await findDirectoriesSmart(this.path.uri, queryTrim, token, { value: this.searchToken });
+            if (this.searchToken !== token) return;
+
+            const searchItems = dirs.map(d => ({
+                label: `$(terminal) Open Terminal in: ${d.name}`,
+                description: vscode.workspace.asRelativePath(d.uri),
+                name: d.name,
+                alwaysShow: true,
+                action: Action.OpenTerminal as any,
+                payload: { uri: d.uri }
+            } as FileItem));
+
+            items.push(...searchItems);
+        } catch (e) { }
+
+        if (this.searchToken === token) {
+            this.current.items = items;
+            // 如果没有输入内容，默认激活“在当前文件夹打开”
+            // 如果有输入，默认激活第一个搜索结果
+            if (items.length > 0) this.current.activeItems = [queryTrim ? (items[1] || items[0]) : items[0]];
+            this.current.busy = false;
+        }
     }
 
     // ================= 核心重构：Bulk 操作逻辑 =================
@@ -1074,11 +1214,11 @@ class FileBrowser {
         });
     }
 
-    // 新增：打开终端方法
-    openTerminal() {
+    openTerminal(targetUri?: Uri) {
+        const uri = targetUri || this.path.uri;
         const terminal = vscode.window.createTerminal({
-            cwd: this.path.uri,
-            name: `Terminal: ${OSPath.basename(this.path.uri.fsPath)}`
+            cwd: uri,
+            name: `Terminal: ${OSPath.basename(uri.fsPath)}`
         });
         terminal.show();
         this.accepted = true;
@@ -1232,7 +1372,11 @@ class FileBrowser {
                     break;
                 }
                 // 处理在文件夹上点击的 Action 
-                case (Action as any).OpenTerminal: { this.openTerminal(); break; } // 在 actions 菜单内使用
+                case Action.OpenTerminal: {
+                    const uri = item.payload?.uri;
+                    this.openTerminal(uri);
+                    break;
+                }
                 case Action.RenameFile: { this.keepAlive = true; this.hide(); await this.rename(); this.show(); this.keepAlive = false; await this.popState(); break; }
                 case Action.DeleteFile: { ensureSafe(this.path.uri); if (await this.confirmAction(`Delete?`, "Trash", true)) { await vscode.workspace.fs.delete(this.path.uri, { recursive: true, useTrash: true }); await this.popState(); } break; }
                 case Action.OpenFolder: { vscode.commands.executeCommand("vscode.openFolder", this.path.uri); break; }
@@ -1245,10 +1389,10 @@ class FileBrowser {
     tabCompletion() {
         if (this.inActions) return;
         const val = this.current.value;
-        if (val.match(/^(\$$|\$|%%|%|@@|@|!|#|:)/)) return;
+        if (val.match(/^(\$$|\$|%%|%|@@|@|!|:)/)) return;
         const tokenMatch = val.match(/(\S+)$/); if (!tokenMatch) return;
         const token = tokenMatch[1];
-        const prefixMatch = token.match(/^([rdcm]:)/);
+        const prefixMatch = token.match(/^([rdcm]:|#|>t)/);
         const cmdPrefix = prefixMatch ? prefixMatch[0] : "";
         const restToken = token.substring(cmdPrefix.length);
         const lastSlashIdx = restToken.lastIndexOf('/');
@@ -1261,7 +1405,7 @@ class FileBrowser {
         const validItems = this.current.items.filter(item =>
             item.fileType !== undefined &&
             item.name &&
-            item.action === undefined
+            (item.action === undefined || item.action === Action.OpenTerminal)
         );
 
         if (validItems.length === 0) return;
@@ -1289,12 +1433,10 @@ class FileBrowser {
             const charStrict = candidates[0].text[j];
             const charLower = charStrict.toLowerCase();
             let allMatchLower = true;
-            let allMatchStrict = true;
             for (let i = 1; i < candidates.length; i++) {
                 if (j >= candidates[i].text.length) { allMatchLower = false; break; }
                 const compareChar = candidates[i].text[j];
                 if (compareChar.toLowerCase() !== charLower) { allMatchLower = false; break; }
-                if (compareChar !== charStrict) allMatchStrict = false;
             }
             if (!allMatchLower) break;
             lcp += charStrict;
