@@ -1389,68 +1389,99 @@ class FileBrowser {
     tabCompletion() {
         if (this.inActions) return;
         const val = this.current.value;
-        if (val.match(/^(\$$|\$|%%|%|@@|@|!|:)/)) return;
-        const tokenMatch = val.match(/(\S+)$/); if (!tokenMatch) return;
-        const token = tokenMatch[1];
-        const prefixMatch = token.match(/^([rdcm]:|#|>t)/);
-        const cmdPrefix = prefixMatch ? prefixMatch[0] : "";
-        const restToken = token.substring(cmdPrefix.length);
-        const lastSlashIdx = restToken.lastIndexOf('/');
-        const searchPart = restToken.substring(lastSlashIdx + 1);
-        if (/[*?]$/.test(searchPart)) return;
-        const typedTextMatch = searchPart.match(/[^*?]+$/);
-        const typedText = typedTextMatch ? typedTextMatch[0] : "";
-        const typedLower = typedText.toLowerCase();
+        if (!val) return;
 
+        // 1. 识别指令前缀 (支持 >t, r:, #, !, @@, @, $, % 等)
+        const cmdMatch = val.match(/^([rdcm]:|#|>t|!|@@|@|\$\$?|%%?|:)\s*/);
+        const cmdPrefix = cmdMatch ? cmdMatch[0] : "";
+        const argsStr = val.substring(cmdPrefix.length);
+
+        // 排除纯文本/行号/诊断搜索的补全
+        if (cmdPrefix.match(/^(\$\$?|%%?|:)\s*$/)) return;
+
+        // 2. 提取需要补全的最后一个 Token (处理批量操作的多参数)
+        let textBeforeToken = "";
+        let tokenToComplete = argsStr;
+
+        if (cmdPrefix.match(/^[rdcm]:\s*$/)) {
+            const lastSpaceIdx = argsStr.lastIndexOf(' ');
+            if (lastSpaceIdx !== -1) {
+                textBeforeToken = argsStr.substring(0, lastSpaceIdx + 1);
+                tokenToComplete = argsStr.substring(lastSpaceIdx + 1);
+            }
+        }
+
+        if (!tokenToComplete) return;
+
+        // 3. 将 Token 拆分为 "含通配符的前缀" 和 "普通后缀"
+        const wildcardIdx = Math.max(tokenToComplete.lastIndexOf('*'), tokenToComplete.lastIndexOf('?'));
+        const wildPrefix = wildcardIdx !== -1 ? tokenToComplete.substring(0, wildcardIdx + 1) : "";
+        const literalSuffix = wildcardIdx !== -1 ? tokenToComplete.substring(wildcardIdx + 1) : tokenToComplete;
+
+        // --- 核心修复：更健壮的正则构建逻辑 ---
+        const escapeForRegex = (str: string) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+        // 关键：先全部转义，再把转义后的通配符 (\* 和 \?) 还原成正则语法 (.* 和 .)
+        const escapedWild = escapeForRegex(wildPrefix)
+            .replace(/\\\*/g, '.*')
+            .replace(/\\\?/g, '.');
+        const escapedLiteral = escapeForRegex(literalSuffix);
+
+        let regex: RegExp;
+        try {
+            // 构建正则：忽略大小写，捕获 literalSuffix 及其之后的真实文本
+            regex = new RegExp(`^(${escapedWild})(${escapedLiteral}.*)$`, "i");
+        } catch (e) {
+            return; // 防止万一用户输入了极其诡异的组合导致正则崩溃
+        }
+
+        // 4. 筛选当前的候选列表
         const validItems = this.current.items.filter(item =>
-            item.fileType !== undefined &&
             item.name &&
-            (item.action === undefined || item.action === Action.OpenTerminal)
+            item.name !== ">t" &&
+            !item.label.includes("Create Pattern:") &&
+            !item.label.includes("Open / Create Path:")
         );
 
         if (validItems.length === 0) return;
 
-        const candidates: { text: string, isDir: boolean }[] = [];
-        for (const item of validItems) {
-            const basename = OSPath.basename(item.name);
-            const basenameLower = basename.toLowerCase();
+        const matchedSuffixes: { full: string, suffix: string, isDir: boolean }[] = [];
 
-            if (typedLower === "" || basenameLower.startsWith(typedLower)) {
-                candidates.push({
-                    text: basename,
-                    isDir: !!(item.fileType !== undefined && item.fileType & FileType.Directory)
+        for (const item of validItems) {
+            const match = item.name.match(regex);
+            if (match) {
+                matchedSuffixes.push({
+                    full: item.name,
+                    suffix: match[2], // 这里拿到的是文件系统中【正确大小写】的文本
+                    isDir: !!(item.fileType !== undefined && (item.fileType & vscode.FileType.Directory))
                 });
             }
         }
 
-        if (candidates.length === 0) return;
+        if (matchedSuffixes.length === 0) return;
 
-        // 计算最长公共前缀 (LCP)
-        let lcp = "";
-        let j = 0;
-        while (true) {
-            if (j >= candidates[0].text.length) break;
-            const charStrict = candidates[0].text[j];
-            const charLower = charStrict.toLowerCase();
-            let allMatchLower = true;
-            for (let i = 1; i < candidates.length; i++) {
-                if (j >= candidates[i].text.length) { allMatchLower = false; break; }
-                const compareChar = candidates[i].text[j];
-                if (compareChar.toLowerCase() !== charLower) { allMatchLower = false; break; }
+        // 5. 计算最长公共前缀 (LCP) - 必须大小写敏感以保持纠正后的效果
+        let lcp = matchedSuffixes[0].suffix;
+        for (let i = 1; i < matchedSuffixes.length; i++) {
+            const curr = matchedSuffixes[i].suffix;
+            let j = 0;
+            while (j < lcp.length && j < curr.length && lcp[j] === curr[j]) {
+                j++;
             }
-            if (!allMatchLower) break;
-            lcp += charStrict;
-            j++;
+            lcp = lcp.substring(0, j);
+            if (lcp === "") break;
         }
 
+        // 6. 组装结果
         let newSuffix = lcp;
-        // 如果仅匹配到一个且为目录，自动补全末尾的斜杠 /
-        if (candidates.length === 1 && candidates[0].text === lcp && candidates[0].isDir) {
+        // 如果是唯一匹配且是目录，且没有斜杠，则补全斜杠
+        if (matchedSuffixes.length === 1 && matchedSuffixes[0].isDir && !newSuffix.endsWith('/')) {
             newSuffix += '/';
         }
 
-        // 替换光标前的输入文本
-        const newValue = val.substring(0, val.length - typedText.length) + newSuffix;
+        const newToken = wildPrefix + newSuffix;
+        const newValue = cmdPrefix + textBeforeToken + newToken;
+
         if (this.current.value !== newValue) {
             this.current.value = newValue;
         }
