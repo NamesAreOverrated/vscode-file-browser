@@ -115,14 +115,47 @@ function applyWildcard(name: string, from: string, to: string): string | null {
 // ================= 路径解析逻辑 =================
 
 function expandBraces(str: string): string[] {
-    const match = str.match(/^(.*?)\{([^{}]+)\}(.*)$/);
-    if (!match) return [str];
-    const results: string[] = [];
-    const parts = match[2].split(',');
-    for (const p of parts) {
-        results.push(...expandBraces(match[1] + p.trim() + match[3]));
+    // 1. 处理数字/字母范围序列 {1..5} 或 {a..e}
+    const rangeMatch = str.match(/^(.*?)\{([0-9a-zA-Z]+)\.\.([0-9a-zA-Z]+)\}(.*)$/);
+    if (rangeMatch) {
+        const [_, pre, startStr, endStr, post] = rangeMatch;
+        const results: string[] = [];
+
+        // 判断是数字还是字符
+        const isNumber = /^\d+$/.test(startStr) && /^\d+$/.test(endStr);
+        if (isNumber) {
+            const start = parseInt(startStr, 10);
+            const end = parseInt(endStr, 10);
+            const step = start < end ? 1 : -1;
+            const padLen = Math.max(startStr.length, endStr.length); // 支持 {01..05} 这种补零
+
+            for (let i = start; start < end ? i <= end : i >= end; i += step) {
+                const numStr = i.toString().padStart(startStr.startsWith('0') ? padLen : 0, '0');
+                results.push(...expandBraces(pre + numStr + post));
+            }
+        } else if (startStr.length === 1 && endStr.length === 1) {
+            const start = startStr.charCodeAt(0);
+            const end = endStr.charCodeAt(0);
+            const step = start < end ? 1 : -1;
+            for (let i = start; start < end ? i <= end : i >= end; i += step) {
+                results.push(...expandBraces(pre + String.fromCharCode(i) + post));
+            }
+        }
+        return results;
     }
-    return results;
+
+    // 2. 处理逗号分隔列表 {a,b,c}
+    const listMatch = str.match(/^(.*?)\{([^{}]+)\}(.*)$/);
+    if (listMatch) {
+        const results: string[] = [];
+        const parts = listMatch[2].split(',');
+        for (const p of parts) {
+            results.push(...expandBraces(listMatch[1] + p.trim() + listMatch[3]));
+        }
+        return results;
+    }
+
+    return [str];
 }
 type ExpandedPath = {
     name: string;
@@ -1012,165 +1045,174 @@ class FileBrowser {
         const token = ++this.searchToken;
         this.current.busy = true;
 
-        const queryValue = fullQuery.substring(2);
+        const queryValue = fullQuery.substring(2); // 去掉 'r:' 等前缀
         const parts = splitArgs(queryValue.trim());
         const matchPattern = parts.length > 0 ? parts[0] : "";
-        const isSingleArg = parts.length === 1;
+        const contextQuery = parts.length > 1 ? parts[parts.length - 1] : matchPattern;
 
-        let exactMatchedItems: FileItem[] = [];
         let finalItems: FileItem[] = [];
+        let mappings: { src: { name: string, uri: Uri }, target: Uri }[] = [];
 
-        // 获取精准匹配源数据
+        // 1. 解析源文件
         let resolvedSources: { name: string, uri: Uri, type: FileType }[] = [];
         if (matchPattern) {
-            try { resolvedSources = await resolveExistingPaths(this.path.uri, matchPattern, matchPattern.endsWith('/')); } catch (e) { }
+            try {
+                resolvedSources = await resolveExistingPaths(this.path.uri, matchPattern, matchPattern.endsWith('/'));
+            } catch (e) { }
         }
+
         if (this.searchToken !== token) return;
-        const sourceUrisSet = new Set(resolvedSources.map(p => p.uri.toString()));
-        const isEditorInCurrentDir = this.editorUri &&
-            (OSPath.dirname(this.editorUri.fsPath) === OSPath.normalize(this.path.uri.fsPath));
 
-        // --- 1. 编辑器单文件快速操作 (便捷逻辑) ---
-        if (isSingleArg && isEditorInCurrentDir && this.editorUri && matchPattern && matchPattern && action !== Action.BulkDelete) {
-            const oldUri = this.editorUri;
-            const newUri = Uri.joinPath(oldUri, '..', matchPattern);
+        // 2. 核心逻辑：根据参数数量和 Action 类型构建映射
+        if (matchPattern && (action === Action.BulkCopy || action === Action.BulkMove || action === Action.BulkRename)) {
+            const toPatternRaw = parts.length >= 2 ? parts[1] : "";
+            const expandedTargets = toPatternRaw ? expandBraces(toPatternRaw) : [""];
 
-            if (action === Action.BulkCopy || action === Action.BulkMove) {
-                const isMove = action === Action.BulkMove;
-                exactMatchedItems.push({
-                    label: `$(files) ${isMove ? 'Move' : 'Copy'} current file -> ${this.getRelativeDisplayPath(newUri)}`,
-                    name: matchPattern,
-                    alwaysShow: true, action: isMove ? Action.SingleMove : Action.SingleCopy,
-                    payload: { oldUri, newUri }
-                } as FileItem);
-            } else if (action === Action.BulkRename) {
-                exactMatchedItems.push({
-                    label: `$(edit) Rename current file -> ${this.getRelativeDisplayPath(newUri)}`,
-                    name: matchPattern,
-                    alwaysShow: true, action: Action.SingleRename,
-                    payload: { oldUri, newUri }
-                } as FileItem);
-            }
-        }
-        // --- 2. 正常 Bulk 操作 ---
-        else if (matchPattern) {
-            // 处理 Copy / Move / Rename 统一逻辑
-            if ((action === Action.BulkCopy || action === Action.BulkMove || action === Action.BulkRename) && parts.length >= 2) {
-                const fromPattern = parts[0];
-                const toPattern = parts[1];
+            const isCopy = action === Action.BulkCopy;
+            const srcCount = resolvedSources.length;
+            const tgtCount = expandedTargets.length;
 
-                // 判断目标是否为目录 (斜杠结尾，或者在文件系统中确实是目录)
-                let isDestDir = toPattern.endsWith('/') || toPattern.endsWith('\\');
-                if (!isDestDir && toPattern !== '') {
-                    // 💡 新增防呆逻辑：如果源文件超过1个且目标没有通配符，它必定是一个目录
-                    if (resolvedSources.length > 1 && !toPattern.includes('*')) {
-                        isDestDir = true;
-                    } else {
-                        try {
-                            const stat = await vscode.workspace.fs.stat(Uri.joinPath(this.path.uri, toPattern));
-                            if (stat.type & FileType.Directory) isDestDir = true;
-                        } catch { }
-                    }
-                }
+            // --- 验证逻辑 ---
 
-                const toDir = isDestDir ? toPattern : OSPath.dirname(toPattern);
-                const toName = isDestDir ? '*' : OSPath.basename(toPattern);
-                const fromName = OSPath.basename(fromPattern);
-
-                const mappings: { src: { name: string, uri: Uri }, target: Uri }[] = [];
-
-                for (const src of resolvedSources) {
-                    const srcBase = OSPath.basename(src.name);
-
-                    // 应用通配符 (例如 *.ts -> *.js)
-                    const newBase = isDestDir
-                        ? srcBase
-                        : (applyWildcard(srcBase, fromName, toName) || toName);
-
-
-                    let targetUri: Uri;
-                    if (toDir === '.' && !toPattern.includes('/')) {
-                        // 如果目标没有指定额外路径，则保留在源文件同级目录
-                        targetUri = Uri.joinPath(src.uri, '..', newBase);
-                    } else {
-                        // 否则基于当前工作目录拼接
-                        targetUri = Uri.joinPath(this.path.uri, toDir, newBase);
-                    }
-                    mappings.push({ src, target: targetUri });
-                }
-
-                const opName = action === Action.BulkRename ? "Rename" : action === Action.BulkMove ? "Move" : "Copy";
-                const opIcon = action === Action.BulkRename ? "$(edit)" : "$(zap)";
-
-                // 顶部执行项
-                if (mappings.length > 0) {
+            // 情况 A: 1个源 -> N个目标
+            if (srcCount === 1 && tgtCount > 1) {
+                if (!isCopy) {
                     finalItems.push({
-                        label: `${opIcon} ${opName} ${mappings.length} items`,
-                        name: fullQuery,
-                        alwaysShow: true,
-                        action: action,
-                        payload: { mappings }
+                        label: `$(error) Illegal Operation`,
+                        description: `Cannot ${action === Action.BulkMove ? 'move' : 'rename'} 1 source to ${tgtCount} targets.`,
+                        name: "", alwaysShow: true
+                    } as FileItem);
+                } else {
+                    // 允许 1 复制到多个目标
+                    for (const targetPath of expandedTargets) {
+                        mappings.push({ src: resolvedSources[0], target: this.resolveTargetUri(resolvedSources[0].name, targetPath, matchPattern) });
+                    }
+                }
+            }
+            // 情况 B: N个源 -> 1个目标
+            else if (srcCount > 1 && tgtCount === 1) {
+                const targetPath = expandedTargets[0];
+                // 如果是多个源到一个目标，目标【必须】是目录
+                const isExplicitDir = targetPath.endsWith('/') || targetPath.endsWith('\\') || targetPath === '.' || targetPath === '..';
+
+                if (!isExplicitDir && tgtCount === 1) {
+                    // 检查物理路径是否已存在且是目录
+                    let isPhysDir = false;
+                    try { const s = await vscode.workspace.fs.stat(Uri.joinPath(this.path.uri, targetPath)); isPhysDir = !!(s.type & FileType.Directory); } catch { }
+
+                    if (!isPhysDir) {
+                        finalItems.push({
+                            label: `$(error) Collision Risk`,
+                            description: `Multiple files cannot be ${action === Action.BulkRename ? 'renamed' : 'moved'} to a single file. Add '/' to target a folder.`,
+                            name: "", alwaysShow: true
+                        } as FileItem);
+                    } else {
+                        for (const src of resolvedSources) mappings.push({ src, target: Uri.joinPath(this.path.uri, targetPath, OSPath.basename(src.name)) });
+                    }
+                } else {
+                    for (const src of resolvedSources) mappings.push({ src, target: Uri.joinPath(this.path.uri, targetPath, OSPath.basename(src.name)) });
+                }
+            }
+            // 情况 C: N个源 -> N个目标 (一一对应)
+            else if (srcCount === tgtCount && srcCount > 1) {
+                for (let i = 0; i < srcCount; i++) {
+                    mappings.push({ src: resolvedSources[i], target: this.resolveTargetUri(resolvedSources[i].name, expandedTargets[i], matchPattern) });
+                }
+            }
+            // 情况 D: 笛卡尔积 (多对多)
+            else if (srcCount > 1 && tgtCount > 1) {
+                if (isCopy) {
+                    // 仅允许 Copy 模式下将所有源放入所有目标文件夹
+                    for (const targetPath of expandedTargets) {
+                        for (const src of resolvedSources) {
+                            mappings.push({ src, target: Uri.joinPath(this.path.uri, targetPath, OSPath.basename(src.name)) });
+                        }
+                    }
+                } else {
+                    finalItems.push({
+                        label: `$(error) Ambiguous Mapping`,
+                        description: `Source count (${srcCount}) and target count (${tgtCount}) must match for ${action === Action.BulkRename ? 'rename' : 'move'}.`,
+                        name: "", alwaysShow: true
                     } as FileItem);
                 }
+            }
 
-                // 列表预览项
-                for (const m of mappings) {
-                    exactMatchedItems.push({
-                        label: `$(arrow-right) ${m.src.name} -> ${this.getRelativeDisplayPath(m.target)}`,
+            // 3. 构建 UI 显示
+            if (mappings.length > 0) {
+                const opName = isCopy ? "Copy" : (action === Action.BulkMove ? "Move" : "Rename");
+                finalItems.push({
+                    label: `$(zap) Execute Bulk ${opName} (${mappings.length} steps)`,
+                    description: `${srcCount} sources → ${tgtCount} target patterns`,
+                    name: fullQuery,
+                    alwaysShow: true,
+                    action: action,
+                    payload: { mappings }
+                } as FileItem);
+
+                // 预览部分映射
+                mappings.slice(0, 10).forEach(m => {
+                    finalItems.push({
+                        label: `  $(arrow-right) ${m.src.name} → ${this.getRelativeDisplayPath(m.target)}`,
                         name: m.src.name,
                         alwaysShow: true,
-                        action: action === Action.BulkCopy ? Action.SingleCopy : (action === Action.BulkMove ? Action.SingleMove : Action.SingleRename),
-                        payload: {
-                            oldUri: m.src.uri,
-                            newUri: m.target
-                        }
+                        action: isCopy ? Action.SingleCopy : (action === Action.BulkMove ? Action.SingleMove : Action.SingleRename),
+                        payload: { oldUri: m.src.uri, newUri: m.target }
                     } as FileItem);
-                }
-
-            }
-            // 处理 Delete 逻辑
-            else if (action === Action.BulkDelete) {
-                const label = matchPattern ? `Delete matching '${matchPattern}' (${resolvedSources.length} items)` : `Type pattern to delete...`;
-                if (resolvedSources.length > 0) {
-                    finalItems.push({
-                        label: `$(trash) ${label}`,
-                        name: fullQuery,
-                        alwaysShow: true,
-                        action,
-                        payload: { uris: resolvedSources.map(r => r.uri) }
-                    } as FileItem);
-                }
-                exactMatchedItems = resolvedSources.map(p => ({
-                    label: `$(trash) ${p.name} (Ready to delete)`,
-                    name: p.name, alwaysShow: true, action: Action.SingleDelete, payload: { uri: p.uri }
-                } as FileItem));
+                });
+                if (mappings.length > 10) finalItems.push({ label: `  ... and ${mappings.length - 10} more`, name: "", alwaysShow: true } as FileItem);
             }
         }
-
-        // --- 补充提示与合并 ---
-        if (finalItems.length === 0 && exactMatchedItems.length === 0) {
-            const opName = action === Action.BulkRename ? "Rename" : action === Action.BulkCopy ? "Copy" : action === Action.BulkMove ? "Move" : "Delete";
-            finalItems.push({ label: `$(info) Bulk ${opName}: type pattern...`, name: fullQuery, alwaysShow: true } as FileItem);
+        else if (action === Action.BulkDelete && resolvedSources.length > 0) {
+            finalItems.push({
+                label: `$(trash) Delete ${resolvedSources.length} items matching '${matchPattern}'`,
+                name: fullQuery,
+                alwaysShow: true, action,
+                payload: { uris: resolvedSources.map(r => r.uri) }
+            } as FileItem);
+            resolvedSources.slice(0, 10).forEach(p => {
+                finalItems.push({ label: `  $(remove) ${p.name}`, name: p.name, alwaysShow: true, action: Action.SingleDelete, payload: { uri: p.uri } } as FileItem);
+            });
         }
 
-        finalItems.push(...exactMatchedItems);
-
-        // --- 3. Context / Unmatched 模糊提示 ---
+        // 4. 补充模糊搜索建议
         try {
-            const fuzzyResults = await searchExistingPaths(this.path.uri, matchPattern || "./");
-            const contextItems = fuzzyResults.filter(m => !sourceUrisSet.has(m.uri.toString())).slice(0, 30).map(m => ({
-                label: (m.type & FileType.Directory) ? `$(folder) ${m.name}` : `$(file) ${m.name}`, name: m.name,
-                description: "Context", alwaysShow: true, fileType: m.type, payload: m.uri
-            }));
-            if (contextItems.length > 0) {
-                finalItems.push({ label: "--- Context / Unmatched ---", name: "", alwaysShow: true } as FileItem);
-                finalItems.push(...contextItems);
+            const suggestions = await searchExistingPaths(this.path.uri, contextQuery || "./");
+            const filteredSug = suggestions
+                .filter(s => !resolvedSources.some(rs => rs.uri.toString() === s.uri.toString()))
+                .slice(0, 10);
+
+            if (filteredSug.length > 0) {
+                finalItems.push({ label: `--- Suggestions for '${contextQuery || './'}' ---`, name: "", alwaysShow: true } as FileItem);
+                filteredSug.forEach(s => {
+                    finalItems.push({
+                        label: (s.type & FileType.Directory) ? `$(folder) ${s.name}` : `$(file) ${s.name}`,
+                        name: s.name, description: parts.length > 1 ? "Target suggestion" : "Source suggestion",
+                        alwaysShow: true, fileType: s.type, payload: s.uri
+                    } as FileItem);
+                });
             }
         } catch (e) { }
 
         this.current.items = finalItems;
         if (finalItems.length > 0) this.current.activeItems = [finalItems[0]];
         this.current.busy = false;
+    }
+
+    /**
+     * 辅助函数：智能解析目标 URI
+     */
+    private resolveTargetUri(srcBaseName: string, targetInput: string, fromPattern: string): Uri {
+        const isDestExplicitDir = targetInput.endsWith('/') || targetInput.endsWith('\\') || targetInput === '.' || targetInput === '..';
+
+        const toDir = isDestExplicitDir ? targetInput : OSPath.dirname(targetInput);
+        const toName = isDestExplicitDir ? '*' : OSPath.basename(targetInput);
+        const fromName = OSPath.basename(fromPattern);
+
+        const finalBaseName = (toName === '*' || toName === '')
+            ? srcBaseName
+            : (applyWildcard(srcBaseName, fromName, toName) || toName);
+
+        return Uri.joinPath(this.path.uri, toDir, finalBaseName);
     }
 
     // ================= 文件操作执行 =================
