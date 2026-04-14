@@ -555,15 +555,18 @@ class FileBrowser {
             this.current.placeholder = "Type a file name, paths, or commands (@@, @, $$, $, ^, etc.)";
             this.current.busy = false;
         });
-        this.current.onDidChangeActive(items => { if (items[0]) this.preview(items[0]); });
+        this.current.onDidChangeActive(items => { this.preview(items[0]); });
     }
+
 
     private previewTimeout?: NodeJS.Timeout;
     private urisToClose = new Set<string>();
 
-    private async preview(item: FileItem) {
+    private async preview(item?: FileItem) {
         if (this.inActions) return;
         if (this.previewTimeout) { clearTimeout(this.previewTimeout); this.previewTimeout = undefined; }
+
+        // 1. 如果选中项为空或无效，立即清理高亮并关闭预览
         if (!item || item.name === "") { this.closePreviewTab(); this.clearDecorations(); return; }
 
         const canPreview = item.action === undefined || item.action === Action.GoToLine || item.action === Action.OpenFile;
@@ -579,25 +582,69 @@ class FileBrowser {
             if (item.payload?.uri) { uri = item.payload.uri; range = item.payload.range; selectionRange = item.payload.selectionRange; }
             else if (item.payload instanceof Uri) { uri = item.payload; }
             else if (item.name && !item.action) { uri = this.path.append(item.name).uri; }
-            if (!uri) return;
+
+            if (!uri) {
+                this.clearDecorations();
+                return;
+            }
 
             try { const stat = await vscode.workspace.fs.stat(uri); if (stat.type & FileType.Directory) return; } catch (e) { return; }
-            this.urisToClose.add(uri.toString());
+
+            // 2. 核心修复：无论接下来要预览什么文件，无条件清空当前所有编辑器的高亮！
+            // 防止从“带有高亮的Symbol”跳到“无高亮的普通File”时残存上一次的装饰器
+            this.clearDecorations();
 
             let targetColumn = vscode.ViewColumn.Active;
+            let isAlreadyPinned = false;
+
+            if (range) {
+                for (const group of vscode.window.tabGroups.all) {
+                    for (const tab of group.tabs) {
+                        if (tab.input instanceof vscode.TabInputText && tab.input.uri.toString() === uri.toString()) {
+                            targetColumn = group.viewColumn;
+                            if (!tab.isPreview) {
+                                isAlreadyPinned = true;
+                            }
+                            break;
+                        }
+                    }
+                    if (targetColumn !== vscode.ViewColumn.Active) break;
+                }
+            } else {
+                const activeGroup = vscode.window.tabGroups.activeTabGroup;
+                for (const tab of activeGroup.tabs) {
+                    if (tab.input instanceof vscode.TabInputText && tab.input.uri.toString() === uri.toString()) {
+                        if (!tab.isPreview) isAlreadyPinned = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!isAlreadyPinned) {
+                this.urisToClose.add(uri.toString());
+            }
+
             try {
                 const editor = await vscode.window.showTextDocument(uri, { preview: true, preserveFocus: true, viewColumn: targetColumn });
-                if (range && !editor.selection.active.isEqual(range.start)) {
-                    this.clearDecorations();
+
+                // 3. 核心修复：移除 `!editor.selection.active.isEqual(range.start)` 这个多余的卡点
+                // 只要当前 Item 携带了 Range，必须重新为其施加高亮，并让屏幕滚动过去
+                if (range) {
                     const targetPos = selectionRange || range;
                     editor.selection = new vscode.Selection(targetPos.start, targetPos.end);
-                    if (item.action === Action.GoToLine) editor.setDecorations(rangeDecorationType, [range]);
-                    else editor.setDecorations(searchDecorationType, [range]);
+
+                    if (item.action === Action.GoToLine) {
+                        editor.setDecorations(rangeDecorationType, [range]);
+                    } else {
+                        editor.setDecorations(searchDecorationType, [range]);
+                    }
+
                     editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
                 }
             } catch (e) { }
         }, 150);
     }
+
 
     private closePreviewTab() {
         if (this.urisToClose.size === 0) return;
@@ -1314,6 +1361,7 @@ class FileBrowser {
         this.accepted = true; // 🎯核心修改：用户确认跳转，此时不再恢复原光标
         if (this.previewTimeout) { clearTimeout(this.previewTimeout); this.previewTimeout = undefined; }
         this.clearDecorations();
+        this.urisToClose.delete(uri.toString());
         let targetColumn = column;
         if (!targetColumn && range) {
             for (const group of vscode.window.tabGroups.all) {
