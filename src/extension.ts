@@ -598,35 +598,47 @@ class FileBrowser {
             const uriStr = uri.toString();
             const activeGroup = vscode.window.tabGroups.activeTabGroup;
 
-            // 优先级 A: 当前活跃分栏是否已打开该文件
-            const tabInActive = activeGroup.tabs.find(t =>
-                t.input instanceof vscode.TabInputText && t.input.uri.toString() === uriStr
-            );
-            if (tabInActive) {
-                targetColumn = activeGroup.viewColumn;
-                if (!tabInActive.isPreview) isAlreadyPinned = true;
-            }
+
 
             if (range) {
-                // 优先级 B: 其他分栏是否已打开该文件
-                if (!targetColumn) {
-                    for (const group of vscode.window.tabGroups.all) {
-                        const foundTab = group.tabs.find(t =>
-                            t.input instanceof vscode.TabInputText && t.input.uri.toString() === uriStr
-                        );
-                        if (foundTab) {
-                            targetColumn = group.viewColumn;
-                            if (!foundTab.isPreview) isAlreadyPinned = true;
-                            break;
-                        }
+                // 只有在存在 range 时，才尝试寻找已存在的编辑器以防跳变
+                const visibleEditors = vscode.window.visibleTextEditors;
+
+                // 优先级 1: 是否在【原始触发搜索的分栏】可见？（最稳定，防止横跳）
+                const editorInOriginal = visibleEditors.find(e =>
+                    e.document.uri.toString() === uriStr && e.viewColumn === this.originalViewColumn
+                );
+
+                if (editorInOriginal) {
+                    targetColumn = editorInOriginal.viewColumn;
+                    isAlreadyPinned = true;
+                } else {
+                    // 优先级 2: 是否在【其他任何】分栏可见？
+                    const anyVisibleEditor = visibleEditors.find(e => e.document.uri.toString() === uriStr);
+                    if (anyVisibleEditor) {
+                        targetColumn = anyVisibleEditor.viewColumn;
+                        isAlreadyPinned = true;
                     }
                 }
             }
 
-            // 优先级 C: 默认回到启动插件时的分栏或当前分栏
+            // 优先级 3: 如果不可见，或者是普通文件打开（无 range），检查当前活跃组的后台
             if (!targetColumn) {
-                targetColumn = this.originalViewColumn || vscode.ViewColumn.Active;
+                const activeGroup = vscode.window.tabGroups.activeTabGroup;
+                const tabInActive = activeGroup.tabs.find(t =>
+                    t.input instanceof vscode.TabInputText && t.input.uri.toString() === uriStr
+                );
+
+                if (tabInActive) {
+                    targetColumn = activeGroup.viewColumn;
+                    if (!tabInActive.isPreview) isAlreadyPinned = true;
+                } else {
+                    // 优先级 4: 默认在原始分栏打开
+                    targetColumn = this.originalViewColumn || vscode.ViewColumn.Active;
+                }
             }
+
+
 
             // 3. 标记管理：如果文件不是被固定（Pinned）打开的，记录下来以便后续自动关闭
             if (!isAlreadyPinned) {
@@ -1402,33 +1414,45 @@ class FileBrowser {
         this.urisToClose.delete(uri.toString());
 
         let targetColumn = column;
+
+        const uriStr = uri.toString();
         if (!targetColumn && range) {
-            const uriStr = uri.toString();
+
+            const visibleEditors = vscode.window.visibleTextEditors;
+
+            // 优先查找原始分栏
+            const editorInOriginal = visibleEditors.find(e =>
+                e.document.uri.toString() === uriStr && e.viewColumn === this.originalViewColumn
+            );
+
+            if (editorInOriginal) {
+                targetColumn = editorInOriginal.viewColumn;
+            } else {
+                // 查找任意分栏
+                const anyVisibleEditor = visibleEditors.find(e => e.document.uri.toString() === uriStr);
+                if (anyVisibleEditor) {
+                    targetColumn = anyVisibleEditor.viewColumn;
+                }
+            }
+        }
+        if (!targetColumn) {
+
             const activeGroup = vscode.window.tabGroups.activeTabGroup;
 
-            // 1. 优先级最高：如果当前活跃分栏里已经有这个文件了（无论是预览还是固定）
+            // 2. 如果不可见，检查是否在【当前活跃分栏】的后台？
             const tabInActive = activeGroup.tabs.find(t =>
                 t.input instanceof vscode.TabInputText && t.input.uri.toString() === uriStr
             );
 
             if (tabInActive) {
+                // 如果在当前分栏后台，就在这开，且继承它原来的 Pinned 状态
                 targetColumn = activeGroup.viewColumn;
             } else {
-                // 2. 优先级第二：遍历所有分栏，看看别的地方有没有打开这个文件
-                for (const group of vscode.window.tabGroups.all) {
-                    const foundTab = group.tabs.find(t =>
-                        t.input instanceof vscode.TabInputText && t.input.uri.toString() === uriStr
-                    );
-                    if (foundTab) {
-                        targetColumn = group.viewColumn;
-                        break;
-                    }
-                }
+                // 3. 其他分栏的后台我们不管（不去惊扰它们），统一在触发搜索的原始分栏开
+                targetColumn = this.originalViewColumn || vscode.ViewColumn.Active;
             }
         }
-        if (!targetColumn) {
-            targetColumn = this.originalViewColumn || ViewColumn.Active;
-        }
+
 
         // 👉 修复 4: 因为用户确认了跳转到这个位置，我们把它从需要回退历史记录的名单中剔除
         const targetKey = `${uri.toString()}::${targetColumn}`;
