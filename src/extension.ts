@@ -523,6 +523,7 @@ class FileBrowser {
     private originalVisibleRanges?: readonly vscode.Range[];
     private originalViewColumn?: vscode.ViewColumn; // 👉 新增这行
     private accepted: boolean = false;
+    private touchedEditors = new Map<string, { selection: vscode.Selection, visibleRanges: readonly vscode.Range[], viewColumn: vscode.ViewColumn, uri: Uri }>();
 
     actionsButton: QuickInputButton = { iconPath: new ThemeIcon("ellipsis"), tooltip: "Actions on selected file" };
     terminalButton: QuickInputButton = { iconPath: new ThemeIcon("terminal"), tooltip: "Open terminal in current folder" }; // 新增：终端按钮
@@ -566,7 +567,6 @@ class FileBrowser {
         if (this.inActions) return;
         if (this.previewTimeout) { clearTimeout(this.previewTimeout); this.previewTimeout = undefined; }
 
-        // 1. 如果选中项为空或无效，立即清理高亮并关闭预览
         if (!item || item.name === "") { this.closePreviewTab(); this.clearDecorations(); return; }
 
         const canPreview = item.action === undefined || item.action === Action.GoToLine || item.action === Action.OpenFile;
@@ -590,32 +590,51 @@ class FileBrowser {
 
             try { const stat = await vscode.workspace.fs.stat(uri); if (stat.type & FileType.Directory) return; } catch (e) { return; }
 
-            // 2. 核心修复：无论接下来要预览什么文件，无条件清空当前所有编辑器的高亮！
-            // 防止从“带有高亮的Symbol”跳到“无高亮的普通File”时残存上一次的装饰器
             this.clearDecorations();
 
             let targetColumn = vscode.ViewColumn.Active;
             let isAlreadyPinned = false;
+            let foundInOriginalColumn = false;
 
-            if (range) {
+
+            // 👉 修复 1: 优先在触发插件时的同一分栏内预览，防止多个 Split 窗口乱跳
+            if (this.editorUri && this.editorUri.toString() === uri.toString() && this.originalViewColumn) {
+                targetColumn = this.originalViewColumn;
+                foundInOriginalColumn = true;
                 for (const group of vscode.window.tabGroups.all) {
-                    for (const tab of group.tabs) {
-                        if (tab.input instanceof vscode.TabInputText && tab.input.uri.toString() === uri.toString()) {
-                            targetColumn = group.viewColumn;
-                            if (!tab.isPreview) {
-                                isAlreadyPinned = true;
+                    if (group.viewColumn === targetColumn) {
+                        for (const tab of group.tabs) {
+                            if (tab.input instanceof vscode.TabInputText && tab.input.uri.toString() === uri.toString()) {
+                                if (!tab.isPreview) isAlreadyPinned = true;
+                                break;
                             }
-                            break;
                         }
                     }
-                    if (targetColumn !== vscode.ViewColumn.Active) break;
                 }
-            } else {
-                const activeGroup = vscode.window.tabGroups.activeTabGroup;
-                for (const tab of activeGroup.tabs) {
-                    if (tab.input instanceof vscode.TabInputText && tab.input.uri.toString() === uri.toString()) {
-                        if (!tab.isPreview) isAlreadyPinned = true;
-                        break;
+            }
+
+            // 如果当前分栏没有，再去寻找其他分栏
+            if (!foundInOriginalColumn) {
+                if (range) {
+                    for (const group of vscode.window.tabGroups.all) {
+                        for (const tab of group.tabs) {
+                            if (tab.input instanceof vscode.TabInputText && tab.input.uri.toString() === uri.toString()) {
+                                targetColumn = group.viewColumn;
+                                if (!tab.isPreview) {
+                                    isAlreadyPinned = true;
+                                }
+                                break;
+                            }
+                        }
+                        if (targetColumn !== vscode.ViewColumn.Active) break;
+                    }
+                } else {
+                    const activeGroup = vscode.window.tabGroups.activeTabGroup;
+                    for (const tab of activeGroup.tabs) {
+                        if (tab.input instanceof vscode.TabInputText && tab.input.uri.toString() === uri.toString()) {
+                            if (!tab.isPreview) isAlreadyPinned = true;
+                            break;
+                        }
                     }
                 }
             }
@@ -627,8 +646,17 @@ class FileBrowser {
             try {
                 const editor = await vscode.window.showTextDocument(uri, { preview: true, preserveFocus: true, viewColumn: targetColumn });
 
-                // 3. 核心修复：移除 `!editor.selection.active.isEqual(range.start)` 这个多余的卡点
-                // 只要当前 Item 携带了 Range，必须重新为其施加高亮，并让屏幕滚动过去
+                // 👉 修复 2: 核心快照逻辑。在修改编辑器光标前，如果这是第一次触碰它，记录其初始状态
+                const stateKey = `${uri.toString()}::${editor.viewColumn}`;
+                if (!this.touchedEditors.has(stateKey)) {
+                    this.touchedEditors.set(stateKey, {
+                        uri: uri,
+                        viewColumn: editor.viewColumn!,
+                        selection: editor.selection,
+                        visibleRanges: editor.visibleRanges
+                    });
+                }
+
                 if (range) {
                     const targetPos = selectionRange || range;
                     editor.selection = new vscode.Selection(targetPos.start, targetPos.end);
@@ -705,13 +733,34 @@ class FileBrowser {
         this.closePreviewTab();
         this.clearDecorations();
 
+        // 👉 修复 3.1: 遍历并还原所有在预览期间被扰乱过光标的编辑器
+        for (const state of this.touchedEditors.values()) {
+            if (!this.accepted && this.editorUri && state.uri.toString() === this.editorUri.toString() && state.viewColumn === this.originalViewColumn) {
+                continue; // 原始触发窗口在下面单独处理以确保焦点回到它身上
+            }
+            // 在后台静默恢复状态，不抢夺焦点
+            vscode.workspace.openTextDocument(state.uri).then(doc => {
+                vscode.window.showTextDocument(doc, {
+                    viewColumn: state.viewColumn,
+                    preserveFocus: true,
+                    preview: false
+                }).then(editor => {
+                    editor.selection = state.selection;
+                    if (state.visibleRanges && state.visibleRanges.length > 0) {
+                        editor.revealRange(state.visibleRanges[0], vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+                    }
+                });
+            });
+        }
+        this.touchedEditors.clear();
+
+        // 👉 修复 3.2: 如果用户取消了操作，确保原始主窗口恢复状态并且夺回焦点
         if (!this.accepted && this.editorUri && this.originalSelection) {
-            // 改为强制打开/显示原来的文档，这样即使原 Tab 被挤到了后台也能立刻切回来
             vscode.workspace.openTextDocument(this.editorUri).then(doc => {
                 vscode.window.showTextDocument(doc, {
                     viewColumn: this.originalViewColumn || vscode.ViewColumn.Active,
-                    preserveFocus: false, // 保证焦点回到编辑器
-                    preview: false        // 确保不会把原来的非预览文件变成预览状态
+                    preserveFocus: false, // 让焦点回到这里
+                    preview: false
                 }).then(editor => {
                     editor.selection = this.originalSelection!;
                     if (this.originalVisibleRanges && this.originalVisibleRanges.length > 0) {
@@ -1358,26 +1407,47 @@ class FileBrowser {
     // ================= 文件操作执行 =================
 
     openFile(uri: Uri, column?: ViewColumn, range?: vscode.Range, selectionRange?: vscode.Range) {
-        this.accepted = true; // 🎯核心修改：用户确认跳转，此时不再恢复原光标
+        this.accepted = true;
         if (this.previewTimeout) { clearTimeout(this.previewTimeout); this.previewTimeout = undefined; }
         this.clearDecorations();
         this.urisToClose.delete(uri.toString());
+
         let targetColumn = column;
         if (!targetColumn && range) {
-            for (const group of vscode.window.tabGroups.all) {
-                for (const tab of group.tabs) {
-                    if (tab.input instanceof vscode.TabInputText && tab.input.uri.toString() === uri.toString() && !tab.isPreview) {
-                        targetColumn = group.viewColumn; break;
+            const uriStr = uri.toString();
+            const activeGroup = vscode.window.tabGroups.activeTabGroup;
+
+            // 1. 优先级最高：如果当前活跃分栏里已经有这个文件了（无论是预览还是固定）
+            const tabInActive = activeGroup.tabs.find(t =>
+                t.input instanceof vscode.TabInputText && t.input.uri.toString() === uriStr
+            );
+
+            if (tabInActive) {
+                targetColumn = activeGroup.viewColumn;
+            } else {
+                // 2. 优先级第二：遍历所有分栏，看看别的地方有没有打开这个文件
+                for (const group of vscode.window.tabGroups.all) {
+                    const foundTab = group.tabs.find(t =>
+                        t.input instanceof vscode.TabInputText && t.input.uri.toString() === uriStr
+                    );
+                    if (foundTab) {
+                        targetColumn = group.viewColumn;
+                        break;
                     }
                 }
-                if (targetColumn) break;
             }
         }
         if (!targetColumn) {
             targetColumn = this.originalViewColumn || ViewColumn.Active;
         }
 
+        // 👉 修复 4: 因为用户确认了跳转到这个位置，我们把它从需要回退历史记录的名单中剔除
+        const targetKey = `${uri.toString()}::${targetColumn}`;
+        this.touchedEditors.delete(targetKey);
+
+        // 调用 dispose 时，除了目标窗口，其他被预览改过位置的无关窗口都会被悄悄复原
         this.dispose();
+
         vscode.workspace.openTextDocument(uri).then((doc) => {
             vscode.window.showTextDocument(doc, { viewColumn: targetColumn || ViewColumn.Active, preview: false }).then(editor => {
                 if (range) { const ts = selectionRange || range; editor.selection = new vscode.Selection(ts.start, ts.end); editor.revealRange(range, vscode.TextEditorRevealType.InCenter); }
