@@ -521,6 +521,7 @@ class FileBrowser {
     // 光标防乱跑：记录初始状态
     private originalSelection?: vscode.Selection;
     private originalVisibleRanges?: readonly vscode.Range[];
+    private originalViewColumn?: vscode.ViewColumn; // 👉 新增这行
     private accepted: boolean = false;
 
     actionsButton: QuickInputButton = { iconPath: new ThemeIcon("ellipsis"), tooltip: "Actions on selected file" };
@@ -539,6 +540,7 @@ class FileBrowser {
             this.editorUri = editor.document.uri;
             this.originalSelection = editor.selection;
             this.originalVisibleRanges = editor.visibleRanges;
+            this.originalViewColumn = editor.viewColumn;
         }
 
         this.current = vscode.window.createQuickPick();
@@ -581,8 +583,8 @@ class FileBrowser {
 
             try { const stat = await vscode.workspace.fs.stat(uri); if (stat.type & FileType.Directory) return; } catch (e) { return; }
             this.urisToClose.add(uri.toString());
-            let targetColumn = vscode.window.tabGroups.activeTabGroup.viewColumn == vscode.ViewColumn.One ? vscode.ViewColumn.Two : vscode.ViewColumn.One;
 
+            let targetColumn = vscode.ViewColumn.Active;
             try {
                 const editor = await vscode.window.showTextDocument(uri, { preview: true, preserveFocus: true, viewColumn: targetColumn });
                 if (range && !editor.selection.active.isEqual(range.start)) {
@@ -656,15 +658,20 @@ class FileBrowser {
         this.closePreviewTab();
         this.clearDecorations();
 
-        // 核心修复：如果用户未确认打开且当前有暂存的原始状态，把光标和滚动位置还原
         if (!this.accepted && this.editorUri && this.originalSelection) {
-            const editor = vscode.window.visibleTextEditors.find(e => e.document.uri.toString() === this.editorUri!.toString());
-            if (editor) {
-                editor.selection = this.originalSelection;
-                if (this.originalVisibleRanges && this.originalVisibleRanges.length > 0) {
-                    editor.revealRange(this.originalVisibleRanges[0], vscode.TextEditorRevealType.InCenterIfOutsideViewport);
-                }
-            }
+            // 改为强制打开/显示原来的文档，这样即使原 Tab 被挤到了后台也能立刻切回来
+            vscode.workspace.openTextDocument(this.editorUri).then(doc => {
+                vscode.window.showTextDocument(doc, {
+                    viewColumn: this.originalViewColumn || vscode.ViewColumn.Active,
+                    preserveFocus: false, // 保证焦点回到编辑器
+                    preview: false        // 确保不会把原来的非预览文件变成预览状态
+                }).then(editor => {
+                    editor.selection = this.originalSelection!;
+                    if (this.originalVisibleRanges && this.originalVisibleRanges.length > 0) {
+                        editor.revealRange(this.originalVisibleRanges[0], vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+                    }
+                });
+            });
         }
 
         setContext(false);
@@ -1308,7 +1315,7 @@ class FileBrowser {
         if (this.previewTimeout) { clearTimeout(this.previewTimeout); this.previewTimeout = undefined; }
         this.clearDecorations();
         let targetColumn = column;
-        if (!targetColumn) {
+        if (!targetColumn && range) {
             for (const group of vscode.window.tabGroups.all) {
                 for (const tab of group.tabs) {
                     if (tab.input instanceof vscode.TabInputText && tab.input.uri.toString() === uri.toString() && !tab.isPreview) {
@@ -1318,6 +1325,10 @@ class FileBrowser {
                 if (targetColumn) break;
             }
         }
+        if (!targetColumn) {
+            targetColumn = this.originalViewColumn || ViewColumn.Active;
+        }
+
         this.dispose();
         vscode.workspace.openTextDocument(uri).then((doc) => {
             vscode.window.showTextDocument(doc, { viewColumn: targetColumn || ViewColumn.Active, preview: false }).then(editor => {
