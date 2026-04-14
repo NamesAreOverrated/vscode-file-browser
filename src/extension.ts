@@ -592,57 +592,46 @@ class FileBrowser {
 
             this.clearDecorations();
 
-            let targetColumn = vscode.ViewColumn.Active;
+            // 2. 探测目标分栏（优先级逻辑）
+            let targetColumn: ViewColumn | undefined;
             let isAlreadyPinned = false;
-            let foundInOriginalColumn = false;
+            const uriStr = uri.toString();
+            const activeGroup = vscode.window.tabGroups.activeTabGroup;
 
-
-            // 👉 修复 1: 优先在触发插件时的同一分栏内预览，防止多个 Split 窗口乱跳
-            if (this.editorUri && this.editorUri.toString() === uri.toString() && this.originalViewColumn) {
-                targetColumn = this.originalViewColumn;
-                foundInOriginalColumn = true;
-                for (const group of vscode.window.tabGroups.all) {
-                    if (group.viewColumn === targetColumn) {
-                        for (const tab of group.tabs) {
-                            if (tab.input instanceof vscode.TabInputText && tab.input.uri.toString() === uri.toString()) {
-                                if (!tab.isPreview) isAlreadyPinned = true;
-                                break;
-                            }
-                        }
-                    }
-                }
+            // 优先级 A: 当前活跃分栏是否已打开该文件
+            const tabInActive = activeGroup.tabs.find(t =>
+                t.input instanceof vscode.TabInputText && t.input.uri.toString() === uriStr
+            );
+            if (tabInActive) {
+                targetColumn = activeGroup.viewColumn;
+                if (!tabInActive.isPreview) isAlreadyPinned = true;
             }
 
-            // 如果当前分栏没有，再去寻找其他分栏
-            if (!foundInOriginalColumn) {
-                if (range) {
+            if (range) {
+                // 优先级 B: 其他分栏是否已打开该文件
+                if (!targetColumn) {
                     for (const group of vscode.window.tabGroups.all) {
-                        for (const tab of group.tabs) {
-                            if (tab.input instanceof vscode.TabInputText && tab.input.uri.toString() === uri.toString()) {
-                                targetColumn = group.viewColumn;
-                                if (!tab.isPreview) {
-                                    isAlreadyPinned = true;
-                                }
-                                break;
-                            }
-                        }
-                        if (targetColumn !== vscode.ViewColumn.Active) break;
-                    }
-                } else {
-                    const activeGroup = vscode.window.tabGroups.activeTabGroup;
-                    for (const tab of activeGroup.tabs) {
-                        if (tab.input instanceof vscode.TabInputText && tab.input.uri.toString() === uri.toString()) {
-                            if (!tab.isPreview) isAlreadyPinned = true;
+                        const foundTab = group.tabs.find(t =>
+                            t.input instanceof vscode.TabInputText && t.input.uri.toString() === uriStr
+                        );
+                        if (foundTab) {
+                            targetColumn = group.viewColumn;
+                            if (!foundTab.isPreview) isAlreadyPinned = true;
                             break;
                         }
                     }
                 }
             }
 
-            if (!isAlreadyPinned) {
-                this.urisToClose.add(uri.toString());
+            // 优先级 C: 默认回到启动插件时的分栏或当前分栏
+            if (!targetColumn) {
+                targetColumn = this.originalViewColumn || vscode.ViewColumn.Active;
             }
 
+            // 3. 标记管理：如果文件不是被固定（Pinned）打开的，记录下来以便后续自动关闭
+            if (!isAlreadyPinned) {
+                this.urisToClose.add(uriStr);
+            }
             try {
                 const editor = await vscode.window.showTextDocument(uri, { preview: true, preserveFocus: true, viewColumn: targetColumn });
 
