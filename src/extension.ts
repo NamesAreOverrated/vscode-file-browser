@@ -1,4 +1,3 @@
-
 import * as vscode from "vscode";
 import { Uri, FileType, QuickInputButton, ThemeIcon, ViewColumn, DocumentSymbol } from "vscode";
 import * as OS from "os";
@@ -94,12 +93,7 @@ function splitArgs(str: string): string[] {
 function applyWildcard(name: string, from: string, to: string): string | null {
     if (!from.includes('*')) return name === from ? to : null;
 
-    // 1. 转义所有的正则特殊字符（注意不转义 * ，留给后面处理）
     let escapedFrom = from.replace(/[.+?^${}()|[\]\\]/g, '\\$&');
-
-    // 2. 转换通配符为捕获组:
-    // ** 匹配任意深度的路径 (.*)
-    // *  匹配单层路径里的非斜杠内容 ([^/]*)
     escapedFrom = escapedFrom.replace(/\*\*/g, '\0');
     escapedFrom = escapedFrom.replace(/\*/g, '([^/]*)');
     escapedFrom = escapedFrom.replace(/\0/g, '(.*)');
@@ -112,15 +106,12 @@ function applyWildcard(name: string, from: string, to: string): string | null {
     let result = '';
     let groupIndex = 1;
 
-    // 3. 将捕获到的内容，按顺序贴回到目标字符串里的 * 中
     for (let i = 0; i < to.length; i++) {
         if (to[i] === '*') {
-            // 如果目标也有 **，消耗掉一个组并跳过下一个 *
             if (i + 1 < to.length && to[i + 1] === '*') {
                 if (groupIndex < match.length) result += match[groupIndex++];
                 i++;
             } else {
-                // 单个 *
                 if (groupIndex < match.length) result += match[groupIndex++];
             }
         } else {
@@ -132,19 +123,17 @@ function applyWildcard(name: string, from: string, to: string): string | null {
 // ================= 路径解析逻辑 =================
 
 function expandBraces(str: string): string[] {
-    // 1. 处理数字/字母范围序列 {1..5} 或 {a..e}
     const rangeMatch = str.match(/^(.*?)\{([0-9a-zA-Z]+)\.\.([0-9a-zA-Z]+)\}(.*)$/);
     if (rangeMatch) {
         const [_, pre, startStr, endStr, post] = rangeMatch;
         const results: string[] = [];
 
-        // 判断是数字还是字符
         const isNumber = /^\d+$/.test(startStr) && /^\d+$/.test(endStr);
         if (isNumber) {
             const start = parseInt(startStr, 10);
             const end = parseInt(endStr, 10);
             const step = start < end ? 1 : -1;
-            const padLen = Math.max(startStr.length, endStr.length); // 支持 {01..05} 这种补零
+            const padLen = Math.max(startStr.length, endStr.length);
 
             for (let i = start; start < end ? i <= end : i >= end; i += step) {
                 const numStr = i.toString().padStart(startStr.startsWith('0') ? padLen : 0, '0');
@@ -161,7 +150,6 @@ function expandBraces(str: string): string[] {
         return results;
     }
 
-    // 2. 处理逗号分隔列表 {a,b,c}
     const listMatch = str.match(/^(.*?)\{([^{}]+)\}(.*)$/);
     if (listMatch) {
         const results: string[] = [];
@@ -201,7 +189,6 @@ export async function expandPaths(
     const isDirHint = pattern.endsWith('/') || pattern.endsWith('\\');
     pattern = pattern.replace(/\\/g, '/');
 
-    // 1️⃣ brace 展开
     const patterns = expandBraces(pattern);
     const results: ExpandedPath[] = [];
     const seen = new Set<string>();
@@ -210,30 +197,25 @@ export async function expandPaths(
         const clean = pat.endsWith('/') ? pat.slice(0, -1) : pat;
         const segments = clean.split('/').filter(Boolean);
 
-        // 状态中增加 isDir 标记，初始假定 baseUri 是目录
         let current: { name: string, uri: Uri, isDir: boolean }[] = [{ name: "", uri: baseUri, isDir: true }];
 
-        // 逐级解析路径段
         for (let i = 0; i < segments.length; i++) {
             const seg = segments[i];
             const next: typeof current = [];
 
             for (const cur of current) {
-                // 如果当前项不是目录，无法进行下一级解析，直接跳过
                 if (!cur.isDir) continue;
 
-                // ../
                 if (seg === '..') {
                     const parentUri = Uri.joinPath(cur.uri, '..');
                     next.push({
                         name: cur.name ? `${cur.name}/..` : '..',
                         uri: parentUri,
-                        isDir: true // 父级必然是目录
+                        isDir: true
                     });
                     continue;
                 }
 
-                // ** (递归搜索)
                 if (seg === '**') {
                     const walk = async (u: Uri, rel: string, depth: number) => {
                         if (depth > maxDepth) return;
@@ -257,7 +239,6 @@ export async function expandPaths(
                     continue;
                 }
 
-                // 通配符匹配 (* 或 ?) 或 模糊搜索
                 if (seg.includes('*') || seg.includes('?') || fuzzy) {
                     try {
                         const entries = await vscode.workspace.fs.readDirectory(cur.uri);
@@ -286,14 +267,12 @@ export async function expandPaths(
                     continue;
                 }
 
-                // 普通路径段：直接拼接
                 const nextUri = Uri.joinPath(cur.uri, seg);
                 let nextIsDir = false;
                 try {
                     const s = await vscode.workspace.fs.stat(nextUri);
                     nextIsDir = !!(s.type & FileType.Directory);
                 } catch {
-                    // 如果文件不存在且不是最后一段，则无法继续
                     if (i < segments.length - 1) continue;
                 }
 
@@ -307,7 +286,6 @@ export async function expandPaths(
             if (current.length === 0) break;
         }
 
-        // 2️⃣ 最终结果构建
         for (const p of current) {
             const key = p.uri.toString();
             if (seen.has(key)) continue;
@@ -324,7 +302,6 @@ export async function expandPaths(
             if (onlyExisting && !exists) continue;
             const isDir = p.isDir;
 
-            // 处理目录展示意图 (末尾斜杠)
             if (isDir && isDirHint && fuzzy) {
                 try {
                     const entries = await vscode.workspace.fs.readDirectory(p.uri);
@@ -341,7 +318,7 @@ export async function expandPaths(
                         });
                     }
                 } catch { }
-                continue; // 用户输入了斜杠，通常不希望看到父目录本身
+                continue;
             }
 
             if (onlyDirs && !isDir) continue;
@@ -392,16 +369,10 @@ export async function resolveCreationPaths(baseUri: Uri, pattern: string): Promi
     }));
 }
 
-/**
- * 智能目录探测：
- * 1. 优先物理扫描（expandPaths）：支持相对路径、空文件夹、通配符。
- * 2. 备选全局索引（findFiles）：当物理扫描结果不足或需要跨 Workspace 搜索时触发。
- */
 async function findDirectoriesSmart(baseUri: Uri, query: string, token: number, searchTokenRef: { value: number }): Promise<ExpandedPath[]> {
     const results: ExpandedPath[] = [];
     const seen = new Set<string>();
 
-    // 1. 如果 Query 为空，展示当前目录下的直接子文件夹 (第一层)
     if (!query) {
         try {
             const entries = await vscode.workspace.fs.readDirectory(baseUri);
@@ -422,8 +393,6 @@ async function findDirectoriesSmart(baseUri: Uri, query: string, token: number, 
         return results;
     }
 
-    // 2. 如果有 Query，执行物理模糊搜索
-    // 限制深度为 3，兼顾性能和直觉（通常用户想找的就在附近）
     const localResults = await expandPaths(baseUri, query, {
         onlyExisting: true,
         onlyDirs: true,
@@ -438,16 +407,13 @@ async function findDirectoriesSmart(baseUri: Uri, query: string, token: number, 
         seen.add(r.uri.toString());
     }
 
-    // 3. 如果结果太少，且不含路径符号，补充全局索引搜索
     if (results.length < 5 && !query.includes('/') && !query.includes('.')) {
         try {
             const globPattern = toCaseInsensitiveGlob(query);
-            // 查找匹配 query 的路径，并取其目录
             const globalFiles = await vscode.workspace.findFiles(`**/*${globPattern}*/**`, '**/node_modules/**', 50);
 
             for (const f of globalFiles) {
                 if (searchTokenRef.value !== token) break;
-                // 向上寻找名字匹配的目录段
                 let currentUri = f;
                 while (currentUri.fsPath.length > (vscode.workspace.getWorkspaceFolder(f)?.uri.fsPath.length || 0)) {
                     const dirUri = Uri.joinPath(currentUri, '..');
@@ -518,15 +484,15 @@ class FileBrowser {
     private searchToken = 0;
     private searchTimeout?: NodeJS.Timeout;
 
-    // 光标防乱跑：记录初始状态
     private originalSelection?: vscode.Selection;
     private originalVisibleRanges?: readonly vscode.Range[];
-    private originalViewColumn?: vscode.ViewColumn; // 👉 新增这行
+    private originalViewColumn?: vscode.ViewColumn;
     private accepted: boolean = false;
     private touchedEditors = new Map<string, { selection: vscode.Selection, visibleRanges: readonly vscode.Range[], viewColumn: vscode.ViewColumn, uri: Uri }>();
+    private exemptTarget?: { uri: string, column: vscode.ViewColumn };
 
     actionsButton: QuickInputButton = { iconPath: new ThemeIcon("ellipsis"), tooltip: "Actions on selected file" };
-    terminalButton: QuickInputButton = { iconPath: new ThemeIcon("terminal"), tooltip: "Open terminal in current folder" }; // 新增：终端按钮
+    terminalButton: QuickInputButton = { iconPath: new ThemeIcon("terminal"), tooltip: "Open terminal in current folder" };
     stepOutButton: QuickInputButton = { iconPath: new ThemeIcon("arrow-left"), tooltip: "Step out of folder" };
     stepInButton: QuickInputButton = { iconPath: new ThemeIcon("arrow-right"), tooltip: "Step into folder" };
 
@@ -535,7 +501,6 @@ class FileBrowser {
         this.file = file;
         this.pathHistory = { [this.path.id]: this.file };
 
-        // 记录光标初始状态，方便取消搜索时还原
         const editor = vscode.window.activeTextEditor;
         if (editor) {
             this.editorUri = editor.document.uri;
@@ -545,7 +510,6 @@ class FileBrowser {
         }
 
         this.current = vscode.window.createQuickPick();
-        // 将 terminal 按钮放到顶部栏中
         this.current.buttons = [this.actionsButton, this.terminalButton, this.stepOutButton, this.stepInButton];
         this.current.placeholder = "Preparing the file list...";
         this.current.onDidHide(() => { if (!this.keepAlive) this.dispose(); });
@@ -559,22 +523,32 @@ class FileBrowser {
         this.current.onDidChangeActive(items => { this.preview(items[0]); });
     }
 
-
+    private previewToken = 0;
     private previewTimeout?: NodeJS.Timeout;
-    private urisToClose = new Set<string>();
+    private currentPreviewTab?: vscode.Tab;
 
     private async preview(item?: FileItem) {
         if (this.inActions) return;
         if (this.previewTimeout) { clearTimeout(this.previewTimeout); this.previewTimeout = undefined; }
 
-        if (!item || item.name === "") { this.closePreviewTab(); this.clearDecorations(); return; }
+        if (!item || item.name === "") {
+            this.closePreviewTab();
+            this.clearDecorations();
+            return;
+        }
 
         const canPreview = item.action === undefined || item.action === Action.GoToLine || item.action === Action.OpenFile;
         if (!canPreview || (item.fileType !== undefined && (item.fileType & FileType.Directory))) {
-            this.closePreviewTab(); this.clearDecorations(); return;
+            this.closePreviewTab();
+            this.clearDecorations();
+            return;
         }
 
+        const currentToken = ++this.previewToken;
+
         this.previewTimeout = setTimeout(async () => {
+            if (this.previewToken !== currentToken) return;
+
             let uri: Uri | undefined;
             let range: vscode.Range | undefined;
             let selectionRange: vscode.Range | undefined;
@@ -583,79 +557,75 @@ class FileBrowser {
             else if (item.payload instanceof Uri) { uri = item.payload; }
             else if (item.name && !item.action) { uri = this.path.append(item.name).uri; }
 
-            if (!uri) {
-                this.clearDecorations();
-                return;
-            }
+            if (!uri) { this.clearDecorations(); return; }
 
             try { const stat = await vscode.workspace.fs.stat(uri); if (stat.type & FileType.Directory) return; } catch (e) { return; }
 
+            const oldTab = this.currentPreviewTab;
             this.clearDecorations();
 
-            // 2. 探测目标分栏（优先级逻辑）
             let targetColumn: ViewColumn | undefined;
-            let isAlreadyPinned = false;
+            let existedBeforePreview = false;
             const uriStr = uri.toString();
-            const activeGroup = vscode.window.tabGroups.activeTabGroup;
-
-
 
             if (range) {
-                // 只有在存在 range 时，才尝试寻找已存在的编辑器以防跳变
                 const visibleEditors = vscode.window.visibleTextEditors;
-
-                // 优先级 1: 是否在【原始触发搜索的分栏】可见？（最稳定，防止横跳）
-                const editorInOriginal = visibleEditors.find(e =>
-                    e.document.uri.toString() === uriStr && e.viewColumn === this.originalViewColumn
-                );
+                const editorInOriginal = visibleEditors.find(e => e.document.uri.toString() === uriStr && e.viewColumn === this.originalViewColumn);
 
                 if (editorInOriginal) {
                     targetColumn = editorInOriginal.viewColumn;
-                    isAlreadyPinned = true;
+                    existedBeforePreview = true;
                 } else {
-                    // 优先级 2: 是否在【其他任何】分栏可见？
                     const anyVisibleEditor = visibleEditors.find(e => e.document.uri.toString() === uriStr);
                     if (anyVisibleEditor) {
                         targetColumn = anyVisibleEditor.viewColumn;
-                        isAlreadyPinned = true;
+                        existedBeforePreview = true;
                     }
                 }
             }
 
-            // 优先级 3: 如果不可见，或者是普通文件打开（无 range），检查当前活跃组的后台
             if (!targetColumn) {
                 const activeGroup = vscode.window.tabGroups.activeTabGroup;
-                const tabInActive = activeGroup.tabs.find(t =>
-                    t.input instanceof vscode.TabInputText && t.input.uri.toString() === uriStr
-                );
+                const tabInActive = activeGroup.tabs.find(t => t.input instanceof vscode.TabInputText && t.input.uri.toString() === uriStr);
 
                 if (tabInActive) {
                     targetColumn = activeGroup.viewColumn;
-                    if (!tabInActive.isPreview) isAlreadyPinned = true;
+                    if (!tabInActive.isPreview) existedBeforePreview = true;
                 } else {
-                    // 优先级 4: 默认在原始分栏打开
                     targetColumn = this.originalViewColumn || vscode.ViewColumn.Active;
                 }
             }
 
-
-
-            // 3. 标记管理：如果文件不是被固定（Pinned）打开的，记录下来以便后续自动关闭
-            if (!isAlreadyPinned) {
-                this.urisToClose.add(uriStr);
-            }
             try {
                 const editor = await vscode.window.showTextDocument(uri, { preview: true, preserveFocus: true, viewColumn: targetColumn });
 
-                // 👉 修复 2: 核心快照逻辑。在修改编辑器光标前，如果这是第一次触碰它，记录其初始状态
-                const stateKey = `${uri.toString()}::${editor.viewColumn}`;
-                if (!this.touchedEditors.has(stateKey)) {
-                    this.touchedEditors.set(stateKey, {
-                        uri: uri,
-                        viewColumn: editor.viewColumn!,
-                        selection: editor.selection,
-                        visibleRanges: editor.visibleRanges
-                    });
+                if (this.previewToken !== currentToken) return;
+
+                const targetGroup = vscode.window.tabGroups.all.find(g => g.viewColumn === editor.viewColumn);
+                const activeTab = targetGroup?.activeTab;
+                const isMatch = activeTab?.input instanceof vscode.TabInputText && activeTab.input.uri.toString() === uriStr;
+
+                if (isMatch && activeTab.isPreview) {
+                    this.currentPreviewTab = activeTab;
+                } else {
+                    this.currentPreviewTab = undefined;
+                }
+
+                if (oldTab && oldTab.input instanceof vscode.TabInputText) {
+                    const oldUriStr = oldTab.input.uri.toString();
+                    if (oldUriStr !== uriStr) {
+                        this.safeCloseTab(oldTab).catch(e => console.error(e));
+                    }
+                }
+
+                if (!activeTab?.isPreview && isMatch) {
+                    const stateKey = `${uriStr}::${editor.viewColumn}`;
+                    if (!this.touchedEditors.has(stateKey)) {
+                        this.touchedEditors.set(stateKey, {
+                            uri: uri, viewColumn: editor.viewColumn!,
+                            selection: editor.selection, visibleRanges: editor.visibleRanges
+                        });
+                    }
                 }
 
                 if (range) {
@@ -674,29 +644,81 @@ class FileBrowser {
         }, 150);
     }
 
-
-    private closePreviewTab() {
-        if (this.urisToClose.size === 0) return;
-        for (const group of vscode.window.tabGroups.all) {
-            for (const tab of group.tabs) {
-                if (tab.input instanceof vscode.TabInputText) {
-                    const uriStr = tab.input.uri.toString();
-                    if (this.urisToClose.has(uriStr)) {
-                        if (tab.isPreview) {
-                            vscode.window.tabGroups.close(tab, true);
-                            this.urisToClose.delete(uriStr);
+    private async safeCloseTab(tab: vscode.Tab) {
+        if (!tab || tab.isPinned) {
+            return;
+        }
+        try {
+            if (tab.input instanceof vscode.TabInputText) {
+                const tabURL = tab.input.uri.toString();
+                for (const group of vscode.window.tabGroups.all) {
+                    if (group.viewColumn === tab.group.viewColumn) {
+                        for (const checkTab of group.tabs) {
+                            if (checkTab.input instanceof vscode.TabInputText) {
+                                const uriStr = checkTab.input.uri.toString();
+                                if (tabURL === uriStr) {
+                                    if (checkTab.isPreview) {
+                                        await vscode.window.tabGroups.close(checkTab, true);
+                                        return;
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
+        } catch (err) {
+            console.error("Failed to safely close tab:", err);
         }
     }
+
+    private closePreviewTab() {
+        if (this.currentPreviewTab) {
+            this.safeCloseTab(this.currentPreviewTab);
+            this.currentPreviewTab = undefined;
+        }
+    }
+
     private clearDecorations() {
         vscode.window.visibleTextEditors.forEach(editor => {
             editor.setDecorations(searchDecorationType, []);
             editor.setDecorations(rangeDecorationType, []);
         });
     }
+
+    private restoreEditorState(state: { uri: Uri, viewColumn: vscode.ViewColumn, selection: vscode.Selection, visibleRanges: readonly vscode.Range[] }, preserveFocus: boolean) {
+        const editor = vscode.window.visibleTextEditors.find(e =>
+            e.document.uri.toString() === state.uri.toString() &&
+            e.viewColumn === state.viewColumn
+        );
+        if (editor) {
+            editor.selection = state.selection;
+            if (state.visibleRanges && state.visibleRanges.length > 0) {
+                editor.revealRange(state.visibleRanges[0], vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+            }
+            if (!preserveFocus) {
+                vscode.window.showTextDocument(editor.document, {
+                    viewColumn: state.viewColumn,
+                    preserveFocus: false,
+                    preview: false
+                });
+            }
+        } else {
+            vscode.workspace.openTextDocument(state.uri).then(doc => {
+                vscode.window.showTextDocument(doc, {
+                    viewColumn: state.viewColumn,
+                    preserveFocus: preserveFocus,
+                    preview: false
+                }).then(e => {
+                    e.selection = state.selection;
+                    if (state.visibleRanges && state.visibleRanges.length > 0) {
+                        e.revealRange(state.visibleRanges[0], vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+                    }
+                });
+            });
+        }
+    }
+
     private getRelativeDisplayPath(uri: Uri): string {
         let rel = OSPath.relative(this.path.uri.fsPath, uri.fsPath);
         if (!rel) return ".";
@@ -704,6 +726,7 @@ class FileBrowser {
         if (rel.startsWith('./')) rel = rel.substring(2);
         return rel;
     }
+
     private pushState() {
         this.stateStack.push({
             path: this.path.clone(),
@@ -734,43 +757,31 @@ class FileBrowser {
         this.closePreviewTab();
         this.clearDecorations();
 
-        // 👉 修复 3.1: 遍历并还原所有在预览期间被扰乱过光标的编辑器
+        // 还原所有被扰乱过的非目标编辑器光标位置
         for (const state of this.touchedEditors.values()) {
-            if (!this.accepted && this.editorUri && state.uri.toString() === this.editorUri.toString() && state.viewColumn === this.originalViewColumn) {
-                continue; // 原始触发窗口在下面单独处理以确保焦点回到它身上
+            if (this.exemptTarget && state.uri.toString() === this.exemptTarget.uri && state.viewColumn === this.exemptTarget.column) {
+                continue;
             }
-            // 在后台静默恢复状态，不抢夺焦点
-            vscode.workspace.openTextDocument(state.uri).then(doc => {
-                vscode.window.showTextDocument(doc, {
-                    viewColumn: state.viewColumn,
-                    preserveFocus: true,
-                    preview: false
-                }).then(editor => {
-                    editor.selection = state.selection;
-                    if (state.visibleRanges && state.visibleRanges.length > 0) {
-                        editor.revealRange(state.visibleRanges[0], vscode.TextEditorRevealType.InCenterIfOutsideViewport);
-                    }
-                });
-            });
+            if (this.editorUri && state.uri.toString() === this.editorUri.toString() && state.viewColumn === this.originalViewColumn) {
+                continue;
+            }
+            this.restoreEditorState(state, true);
         }
-        this.touchedEditors.clear();
 
-        // 👉 修复 3.2: 如果用户取消了操作，确保原始主窗口恢复状态并且夺回焦点
-        if (!this.accepted && this.editorUri && this.originalSelection) {
-            vscode.workspace.openTextDocument(this.editorUri).then(doc => {
-                vscode.window.showTextDocument(doc, {
+        // 原始主窗口的处理
+        if (this.editorUri && this.originalSelection) {
+            const isExempt = this.exemptTarget && (this.editorUri.toString() === this.exemptTarget.uri && this.originalViewColumn === this.exemptTarget.column);
+            if (!isExempt) {
+                this.restoreEditorState({
+                    uri: this.editorUri,
                     viewColumn: this.originalViewColumn || vscode.ViewColumn.Active,
-                    preserveFocus: false, // 让焦点回到这里
-                    preview: false
-                }).then(editor => {
-                    editor.selection = this.originalSelection!;
-                    if (this.originalVisibleRanges && this.originalVisibleRanges.length > 0) {
-                        editor.revealRange(this.originalVisibleRanges[0], vscode.TextEditorRevealType.InCenterIfOutsideViewport);
-                    }
-                });
-            });
+                    selection: this.originalSelection,
+                    visibleRanges: this.originalVisibleRanges || []
+                }, this.accepted); // 如果用户主动确认跳转至某处，保持还原但不强夺焦点；如果是退出取消，强行夺回焦点
+            }
         }
 
+        this.touchedEditors.clear();
         setContext(false);
         this.current.dispose();
         active = None;
@@ -783,7 +794,7 @@ class FileBrowser {
         if (button === this.stepInButton) this.stepIn();
         else if (button === this.stepOutButton) this.stepOut();
         else if (button === this.actionsButton) this.actions();
-        else if (button === this.terminalButton) this.openTerminal(); // 触发终端命令
+        else if (button === this.terminalButton) this.openTerminal();
     }
 
     async update() {
@@ -803,7 +814,7 @@ class FileBrowser {
             this.items = [
                 action("$(folder-opened) Open this folder", Action.OpenFolder),
                 action("$(folder-opened) Open this folder in a new window", Action.OpenFolderInNewWindow),
-                action("$(terminal) Open terminal here", Action.OpenTerminal as any), // 触发终端 Action
+                action("$(terminal) Open terminal here", Action.OpenTerminal),
                 action("$(edit) Rename this folder", Action.RenameFile),
                 action("$(trash) Delete this folder", Action.DeleteFile),
             ];
@@ -847,7 +858,6 @@ class FileBrowser {
         if (!this.path.atTop()) {
             const parentPath = this.path.clone();
             parentPath.pop();
-            // 如果跳出工作区不安全，阻止跳出并提示
             if (!isPathSafe(parentPath.uri)) {
                 vscode.window.showInformationMessage("Cannot step out: Outside of workspace bounds.");
                 return;
@@ -987,7 +997,6 @@ class FileBrowser {
             const matched = await searchExistingPaths(this.path.uri, value);
             displayItems = matched.map(m => {
                 const item = new FileItem([m.name, m.type]);
-                // 这里的 m.name 现在会包含像 "../../target" 这样的路径
                 item.label = (m.type & FileType.Directory) ? `$(folder) ${m.name}` : `$(file) ${m.name}`;
                 return item;
             });
@@ -1049,7 +1058,7 @@ class FileBrowser {
                 const relToCurrent = this.getRelativeDisplayPath(uri);
                 return {
                     label: `$(file) ${OSPath.basename(uri.fsPath)}`,
-                    description: `rel: ${relToCurrent}`, // 这里显示相对于当前文件夹的路径
+                    description: `rel: ${relToCurrent}`,
                     name: OSPath.basename(uri.fsPath),
                     alwaysShow: true,
                     payload: uri,
@@ -1076,7 +1085,6 @@ class FileBrowser {
             }
             for (const m of existingMatches) {
                 items.push({
-                    // m.name 现在通过 expandPaths 会返回用户输入的相对形式
                     label: (m.type & FileType.Directory) ? `$(folder) ${m.name}` : `$(file) ${m.name}`,
                     name: m.name,
                     description: "Existing Match",
@@ -1092,11 +1100,10 @@ class FileBrowser {
 
     async handleGlobalFolderSearch(query: string) {
         const token = ++this.searchToken;
-        const queryTrim = query.trim(); // 保持为空，如果用户没输入
+        const queryTrim = query.trim();
         this.current.busy = true;
 
         try {
-            // 直接传入 queryTrim，如果为空，findDirectoriesSmart 会返回第一层子目录
             const results = await findDirectoriesSmart(this.path.uri, queryTrim, token, { value: this.searchToken });
             if (this.searchToken !== token) return;
 
@@ -1124,7 +1131,6 @@ class FileBrowser {
 
         const items: FileItem[] = [];
 
-        // 固定项：在当前文件夹打开
         items.push({
             label: `$(terminal) Open Terminal in Current Folder`,
             description: `./ (${this.path.fsPath})`,
@@ -1135,7 +1141,6 @@ class FileBrowser {
         } as FileItem);
 
         try {
-            // 获取智能建议（空 query 时返回第一层子文件夹）
             const dirs = await findDirectoriesSmart(this.path.uri, queryTrim, token, { value: this.searchToken });
             if (this.searchToken !== token) return;
 
@@ -1153,8 +1158,6 @@ class FileBrowser {
 
         if (this.searchToken === token) {
             this.current.items = items;
-            // 如果没有输入内容，默认激活“在当前文件夹打开”
-            // 如果有输入，默认激活第一个搜索结果
             if (items.length > 0) this.current.activeItems = [queryTrim ? (items[1] || items[0]) : items[0]];
             this.current.busy = false;
         }
@@ -1166,7 +1169,7 @@ class FileBrowser {
         const token = ++this.searchToken;
         this.current.busy = true;
 
-        const queryValue = fullQuery.substring(2); // 去掉 'r:' 等前缀
+        const queryValue = fullQuery.substring(2);
         const parts = splitArgs(queryValue.trim());
         const matchPattern = parts.length > 0 ? parts[0] : "";
         const toPatternRaw = parts.length >= 2 ? parts[1] : "";
@@ -1178,7 +1181,6 @@ class FileBrowser {
         const isEditorInCurrentDir = !!(this.editorUri &&
             (OSPath.dirname(this.editorUri.fsPath) === OSPath.normalize(this.path.uri.fsPath)));
 
-        // --- 1. 编辑器单文件快速操作 (便捷逻辑) ---
         if (isSingleArg && isEditorInCurrentDir && this.editorUri && matchPattern && action !== Action.BulkDelete) {
             const oldUri = this.editorUri;
             const newUri = Uri.joinPath(oldUri, '..', matchPattern);
@@ -1201,13 +1203,11 @@ class FileBrowser {
             }
         }
 
-        // --- 2. 核心逻辑：基于 Pattern 的多文件映射 ---
         else if (matchPattern && (action === Action.BulkCopy || action === Action.BulkMove || action === Action.BulkRename)) {
             const fromPatterns = expandBraces(matchPattern);
             const toPatterns = toPatternRaw ? expandBraces(toPatternRaw) : [""];
             const isCopy = action === Action.BulkCopy;
 
-            // 情况 A：模式数量一致（多对多一对一精确映射，例如 r: {a,b}/*.ts {a,b}/*.js）
             if (fromPatterns.length > 1 && toPatterns.length > 1 && fromPatterns.length === toPatterns.length) {
                 for (let i = 0; i < fromPatterns.length; i++) {
                     const fromPat = fromPatterns[i];
@@ -1220,7 +1220,6 @@ class FileBrowser {
                     } catch (e) { }
                 }
             }
-            // 情况 B：N 个源模式 -> 1 个目标模式
             else if (toPatterns.length === 1) {
                 const toPat = toPatterns[0];
                 const isExplicitDir = toPat.endsWith('/') || toPat.endsWith('\\') || toPat === '.' || toPat === '..';
@@ -1237,7 +1236,6 @@ class FileBrowser {
                     } catch (e) { }
                 }
 
-                // 冲突校验：不带通配符且不是目录，多文件不能映射到单体文件
                 if (!isExplicitDir && allSrc.length > 1 && !toPat.includes('*')) {
                     let isPhysDir = false;
                     try { const s = await vscode.workspace.fs.stat(Uri.joinPath(this.path.uri, toPat)); isPhysDir = !!(s.type & FileType.Directory); } catch { }
@@ -1249,7 +1247,6 @@ class FileBrowser {
                             name: "", alwaysShow: true
                         } as FileItem);
                     } else {
-                        // 回退到 Bash CP 目录模式
                         for (const src of allSrc) {
                             mappings.push({ src, target: Uri.joinPath(this.path.uri, toPat, OSPath.basename(src.name)) });
                         }
@@ -1260,7 +1257,6 @@ class FileBrowser {
                     }
                 }
             }
-            // 情况 C：1 个源模式 -> N 个目标模式 (只允许 Copy 广播)
             else if (fromPatterns.length === 1 && toPatterns.length > 1) {
                 if (!isCopy) {
                     finalItems.push({
@@ -1280,7 +1276,6 @@ class FileBrowser {
                     } catch (e) { }
                 }
             }
-            // 情况 D：完全不匹配的错位展开
             else {
                 finalItems.push({
                     label: `$(error) Ambiguous Mapping`,
@@ -1291,7 +1286,6 @@ class FileBrowser {
 
             if (this.searchToken !== token) return;
 
-            // 3. 构建 UI 显示
             if (mappings.length > 0 && finalItems.length === 0) {
                 const opName = isCopy ? "Copy" : (action === Action.BulkMove ? "Move" : "Rename");
                 finalItems.push({
@@ -1303,7 +1297,6 @@ class FileBrowser {
                     payload: { mappings }
                 } as FileItem);
 
-                // 预览部分映射
                 mappings.slice(0, 10).forEach(m => {
                     finalItems.push({
                         label: `  $(arrow-right) ${m.src.name} → ${this.getRelativeDisplayPath(m.target)}`,
@@ -1349,7 +1342,6 @@ class FileBrowser {
 
         if (this.searchToken !== token) return;
 
-        // 4. 补充模糊搜索建议 (规避无结果白板并提供参考)
         const contextQuery = parts.length > 1 ? parts[parts.length - 1] : matchPattern;
         try {
             const suggestions = await searchExistingPaths(this.path.uri, contextQuery || "./");
@@ -1383,18 +1375,13 @@ class FileBrowser {
         }
     }
 
-    /**
-     * 辅助函数：智能解析目标 URI
-     */
     private resolveTargetUri(srcRelPath: string, targetInput: string, fromPattern: string): Uri {
-        // 如果用户目标指名道姓结尾是斜杠 (像 bash 的 cp 到目录一样)
         const isDestExplicitDir = targetInput.endsWith('/') || targetInput.endsWith('\\') || targetInput === '.' || targetInput === '..';
 
         if (isDestExplicitDir) {
             return Uri.joinPath(this.path.uri, targetInput, OSPath.basename(srcRelPath));
         }
 
-        // 触发精确的基于分组推算的通配符重组替换
         if (targetInput.includes('*')) {
             const transformedName = applyWildcard(srcRelPath, fromPattern, targetInput);
             if (transformedName) {
@@ -1409,61 +1396,56 @@ class FileBrowser {
 
     openFile(uri: Uri, column?: ViewColumn, range?: vscode.Range, selectionRange?: vscode.Range) {
         this.accepted = true;
+        this.previewToken++;
         if (this.previewTimeout) { clearTimeout(this.previewTimeout); this.previewTimeout = undefined; }
         this.clearDecorations();
-        this.urisToClose.delete(uri.toString());
 
         let targetColumn = column;
-
         const uriStr = uri.toString();
+
         if (!targetColumn && range) {
-
             const visibleEditors = vscode.window.visibleTextEditors;
-
-            // 优先查找原始分栏
             const editorInOriginal = visibleEditors.find(e =>
                 e.document.uri.toString() === uriStr && e.viewColumn === this.originalViewColumn
             );
-
-            if (editorInOriginal) {
-                targetColumn = editorInOriginal.viewColumn;
-            } else {
-                // 查找任意分栏
+            if (editorInOriginal) { targetColumn = editorInOriginal.viewColumn; }
+            else {
                 const anyVisibleEditor = visibleEditors.find(e => e.document.uri.toString() === uriStr);
-                if (anyVisibleEditor) {
-                    targetColumn = anyVisibleEditor.viewColumn;
-                }
+                if (anyVisibleEditor) { targetColumn = anyVisibleEditor.viewColumn; }
             }
         }
         if (!targetColumn) {
-
             const activeGroup = vscode.window.tabGroups.activeTabGroup;
-
-            // 2. 如果不可见，检查是否在【当前活跃分栏】的后台？
             const tabInActive = activeGroup.tabs.find(t =>
                 t.input instanceof vscode.TabInputText && t.input.uri.toString() === uriStr
             );
-
-            if (tabInActive) {
-                // 如果在当前分栏后台，就在这开，且继承它原来的 Pinned 状态
-                targetColumn = activeGroup.viewColumn;
-            } else {
-                // 3. 其他分栏的后台我们不管（不去惊扰它们），统一在触发搜索的原始分栏开
-                targetColumn = this.originalViewColumn || vscode.ViewColumn.Active;
-            }
+            if (tabInActive) { targetColumn = activeGroup.viewColumn; }
+            else { targetColumn = this.originalViewColumn || vscode.ViewColumn.Active; }
         }
 
+        if (this.currentPreviewTab && this.currentPreviewTab.input instanceof vscode.TabInputText && this.currentPreviewTab.input.uri.toString() === uriStr) {
+            if (targetColumn === ViewColumn.Beside || (column !== undefined && targetColumn !== this.currentPreviewTab.group.viewColumn)) {
+                this.closePreviewTab();
+            } else {
+                this.currentPreviewTab = undefined;
+            }
+        } else {
+            this.closePreviewTab();
+        }
 
-        // 👉 修复 4: 因为用户确认了跳转到这个位置，我们把它从需要回退历史记录的名单中剔除
-        const targetKey = `${uri.toString()}::${targetColumn}`;
-        this.touchedEditors.delete(targetKey);
+        // 我们设置一个目标例外：当 dispose() 执行清扫时，不要重置这组目标的状态
+        this.exemptTarget = { uri: uriStr, column: targetColumn };
 
-        // 调用 dispose 时，除了目标窗口，其他被预览改过位置的无关窗口都会被悄悄复原
+        // 因为不再依赖阻断，交给 dispose 去执行非常安全的所有其它编辑器的复原工作
         this.dispose();
 
         vscode.workspace.openTextDocument(uri).then((doc) => {
             vscode.window.showTextDocument(doc, { viewColumn: targetColumn || ViewColumn.Active, preview: false }).then(editor => {
-                if (range) { const ts = selectionRange || range; editor.selection = new vscode.Selection(ts.start, ts.end); editor.revealRange(range, vscode.TextEditorRevealType.InCenter); }
+                if (range) {
+                    const ts = selectionRange || range;
+                    editor.selection = new vscode.Selection(ts.start, ts.end);
+                    editor.revealRange(range, vscode.TextEditorRevealType.InCenter);
+                }
             });
         });
     }
@@ -1625,7 +1607,6 @@ class FileBrowser {
                     }
                     break;
                 }
-                // 处理在文件夹上点击的 Action 
                 case Action.OpenTerminal: {
                     const uri = item.payload?.uri;
                     this.openTerminal(uri);
@@ -1645,15 +1626,12 @@ class FileBrowser {
         const val = this.current.value;
         if (!val) return;
 
-        // 1. 识别指令前缀 (支持 >t, r:, #, !, @@, @, $, % 等)
         const cmdMatch = val.match(/^([rdcm]:|#|>t|!|@@|@|\$\$?|%%?|:)\s*/);
         const cmdPrefix = cmdMatch ? cmdMatch[0] : "";
         const argsStr = val.substring(cmdPrefix.length);
 
-        // 排除纯文本/行号/诊断搜索的补全
         if (cmdPrefix.match(/^(\$\$?|%%?|:)\s*$/)) return;
 
-        // 2. 提取需要补全的最后一个 Token (处理批量操作的多参数)
         let textBeforeToken = "";
         let tokenToComplete = argsStr;
 
@@ -1667,15 +1645,12 @@ class FileBrowser {
 
         if (!tokenToComplete) return;
 
-        // 3. 将 Token 拆分为 "含通配符的前缀" 和 "普通后缀"
         const wildcardIdx = Math.max(tokenToComplete.lastIndexOf('*'), tokenToComplete.lastIndexOf('?'));
         const wildPrefix = wildcardIdx !== -1 ? tokenToComplete.substring(0, wildcardIdx + 1) : "";
         const literalSuffix = wildcardIdx !== -1 ? tokenToComplete.substring(wildcardIdx + 1) : tokenToComplete;
 
-        // --- 核心修复：更健壮的正则构建逻辑 ---
         const escapeForRegex = (str: string) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-        // 关键：先全部转义，再把转义后的通配符 (\* 和 \?) 还原成正则语法 (.* 和 .)
         const escapedWild = escapeForRegex(wildPrefix)
             .replace(/\\\*/g, '.*')
             .replace(/\\\?/g, '.');
@@ -1683,13 +1658,11 @@ class FileBrowser {
 
         let regex: RegExp;
         try {
-            // 构建正则：忽略大小写，捕获 literalSuffix 及其之后的真实文本
             regex = new RegExp(`^(${escapedWild})(${escapedLiteral}.*)$`, "i");
         } catch (e) {
-            return; // 防止万一用户输入了极其诡异的组合导致正则崩溃
+            return;
         }
 
-        // 4. 筛选当前的候选列表
         const validItems = this.current.items.filter(item =>
             item.name &&
             item.name !== ">t" &&
@@ -1706,7 +1679,7 @@ class FileBrowser {
             if (match) {
                 matchedSuffixes.push({
                     full: item.name,
-                    suffix: match[2], // 这里拿到的是文件系统中【正确大小写】的文本
+                    suffix: match[2],
                     isDir: !!(item.fileType !== undefined && (item.fileType & vscode.FileType.Directory))
                 });
             }
@@ -1714,7 +1687,6 @@ class FileBrowser {
 
         if (matchedSuffixes.length === 0) return;
 
-        // 5. 计算最长公共前缀 (LCP) - 必须大小写敏感以保持纠正后的效果
         let lcp = matchedSuffixes[0].suffix;
         for (let i = 1; i < matchedSuffixes.length; i++) {
             const curr = matchedSuffixes[i].suffix;
@@ -1726,9 +1698,7 @@ class FileBrowser {
             if (lcp === "") break;
         }
 
-        // 6. 组装结果
         let newSuffix = lcp;
-        // 如果是唯一匹配且是目录，且没有斜杠，则补全斜杠
         if (matchedSuffixes.length === 1 && matchedSuffixes[0].isDir && !newSuffix.endsWith('/')) {
             newSuffix += '/';
         }
