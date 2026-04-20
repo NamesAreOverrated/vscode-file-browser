@@ -52,6 +52,11 @@
                     "default": true,
                     "description": "[Search] Exclude files matching VS Code's 'files.exclude' and 'search.exclude' when doing global/text searches (## , ! , etc)."
                 },
+                "file-browser.search.respectGitIgnore": {
+                    "type": "boolean",
+                    "default": true,
+                    "description": "[Search] Also exclude files/folders listed in .gitignore or .ignore during searches."
+                },
                 "file-browser.search.excludePatterns": {
                     "type": "array",
                     "items": {
