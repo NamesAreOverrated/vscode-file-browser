@@ -43,13 +43,18 @@ export class Rules {
     // ==== 新增方法：直接判断某个 Uri 是否被 ignore 规则命中 ====
     public ignoresUri(uri: Uri): boolean {
         if (this.name === "empty") return false;
-        // 计算目标文件相对于 .gitignore 文件所在目录的相对路径
-        let relPath = OSPath.relative(this.path.fsPath, uri.fsPath).replace(/\\/g, '/');
+        try {
+            // 计算目标文件相对于 .gitignore 文件所在目录的相对路径
+            let relPath = OSPath.relative(this.path.fsPath, uri.fsPath).replace(/\\/g, '/');
 
-        // 如果文件在 ignore 工作区之外（比如上级目录），则不忽略
-        if (relPath.startsWith('..') || relPath === '') return false;
+            // 如果文件在 ignore 工作区之外（比如上级目录或跨盘符导致的绝对路径），则直接不忽略
+            if (relPath.startsWith('..') || relPath === '' || OSPath.isAbsolute(relPath)) return false;
 
-        return this.rules.test(relPath).ignored;
+            return this.rules.test(relPath).ignored;
+        } catch (e) {
+            // 防止由于奇怪的虚拟路径、外部路径导致 ignore 库报错使得功能崩溃
+            return false;
+        }
     }
 
     filter(base: Path, items: FileItem[]): FileItem[] {
@@ -58,7 +63,11 @@ export class Rules {
             if (itemIsDir(item)) {
                 relativePathStr += "/";
             }
-            return !this.rules.test(relativePathStr).ignored;
+            try {
+                return !this.rules.test(relativePathStr).ignored;
+            } catch (e) {
+                return true;
+            }
         });
     }
 }

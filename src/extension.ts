@@ -1,3 +1,4 @@
+
 import * as vscode from "vscode";
 import { Uri, FileType, QuickInputButton, ThemeIcon, ViewColumn, DocumentSymbol } from "vscode";
 import * as OS from "os";
@@ -1154,29 +1155,64 @@ class FileBrowser {
     }
 
     async handleWorkspaceSymbolSearch(query: string) {
-        query = query.trim(); if (query.length < 2) { this.current.items = [{ label: "Type at least 2 chars to search workspace symbols...", name: "", alwaysShow: true } as FileItem]; return; }
-        const token = ++this.searchToken; this.current.busy = true;
+        query = query.trim();
+        if (query.length < 2) {
+            this.current.items = [{ label: "Type at least 2 chars to search workspace symbols...", name: "", alwaysShow: true } as FileItem];
+            return;
+        }
+
+        const token = ++this.searchToken;
+        this.current.busy = true;
+
         try {
             const symbols = await vscode.commands.executeCommand<vscode.SymbolInformation[]>('vscode.executeWorkspaceSymbolProvider', query);
-            if (this.searchToken !== token) return; if (!symbols || symbols.length === 0) { this.current.items = [{ label: "No symbols found in workspace.", name: "", alwaysShow: true } as FileItem]; return; }
-            const importantKinds = new Set([vscode.SymbolKind.Class, vscode.SymbolKind.Method, vscode.SymbolKind.Function, vscode.SymbolKind.Field, vscode.SymbolKind.Property, vscode.SymbolKind.Struct, vscode.SymbolKind.Interface, vscode.SymbolKind.Enum, vscode.SymbolKind.Event, vscode.SymbolKind.Constructor]);
-            let filtered = symbols.filter(s => importantKinds.has(s.kind));
-            const rules = await this.getGitIgnoreRules();
-            if (rules) {
-                filtered = filtered.filter(s => !rules.ignoresUri(s.location.uri));
+
+            if (this.searchToken !== token) return;
+
+            if (!symbols || symbols.length === 0) {
+                this.current.items = [{ label: "No symbols found in workspace.", name: "", alwaysShow: true } as FileItem];
+                return;
             }
 
+            let filtered = symbols;
 
+            const rules = await this.getGitIgnoreRules();
+            if (rules) {
+                filtered = filtered.filter(s => {
+                    try {
+                        return !rules.ignoresUri(s.location.uri);
+                    } catch {
+                        return true; // 如果因为跨盘符等异常无法判断 ignore，默认放行
+                    }
+                });
+            }
 
             this.current.items = filtered.slice(0, 200).map(s => {
-                const container = s.containerName ? `${s.containerName} • ` : ''; const path = vscode.workspace.asRelativePath(s.location.uri);
+                const container = s.containerName ? `${s.containerName} • ` : '';
+                const path = vscode.workspace.asRelativePath(s.location.uri);
+
+                const range = s.location?.range;
+                const lineStr = range?.start?.line !== undefined ? ` : ${range.start.line + 1}` : '';
+                const selectionRange = range ? new vscode.Range(range.start, range.start) : undefined;
+
                 return {
-                    label: `${getSymbolIcon(s.kind)} ${s.name}`, name: s.name, description: `${container}${path} : ${s.location.range.start.line + 1}`, alwaysShow: true, fileType: FileType.File,
-                    payload: { uri: s.location.uri, range: s.location.range, selectionRange: new vscode.Range(s.location.range.start, s.location.range.start) }
+                    label: `${getSymbolIcon(s.kind)} ${s.name}`,
+                    name: s.name,
+                    description: `${container}${path}${lineStr}`,
+                    alwaysShow: true,
+                    fileType: FileType.File,
+                    payload: { uri: s.location.uri, range, selectionRange }
                 } as FileItem;
             });
-            if (this.current.items.length === 0) { this.current.items = [{ label: "No important symbols found.", name: "", alwaysShow: true } as FileItem]; }
-        } catch (e) { } finally { if (this.searchToken === token) this.current.busy = false; }
+
+            if (this.current.items.length === 0) {
+                this.current.items = [{ label: "No matches after applying filters.", name: "", alwaysShow: true } as FileItem];
+            }
+        } catch (e) {
+            console.error("Workspace symbol search error:", e);
+        } finally {
+            if (this.searchToken === token) this.current.busy = false;
+        }
     }
 
     handleLineSearch(query: string) {
