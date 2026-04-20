@@ -1174,7 +1174,9 @@ class FileBrowser {
                 return;
             }
 
-            let filtered = symbols;
+            let filtered = symbols.filter(s => {
+                return isPathSafe(s.location.uri);
+            });
 
             const rules = await this.getGitIgnoreRules();
             if (rules) {
