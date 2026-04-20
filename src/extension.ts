@@ -443,14 +443,13 @@ async function findDirectoriesSmart(baseUri: Uri, query: string, token: number, 
 // ================= 配置与上下文 =================
 
 export enum ConfigItem {
-    RemoveIgnoredFiles = "removeIgnoredFiles",
-    HideDotfiles = "hideDotfiles",
-    HideIgnoreFiles = "hideIgnoredFiles",
-    IgnoreFileTypes = "ignoreFileTypes",
-    LabelIgnoredFiles = "labelIgnoredFiles",
+    ShowHidden = "showHidden",
+    UseGitIgnore = "useGitIgnore",
+    RespectExcludes = "respectVSCodeExcludes",
     SearchExcludePattern = "searchExcludePattern",
     PreviewIgnoreExtensions = "previewIgnoreExtensions",
 }
+
 
 export function config<A>(item: ConfigItem): A | undefined {
     return vscode.workspace.getConfiguration("file-browser").get(item);
@@ -840,8 +839,32 @@ class FileBrowser {
             const records = await vscode.workspace.fs.readDirectory(this.path.uri);
             records.sort(fileRecordCompare);
             let items = records.map((entry) => new FileItem(entry));
-            if (config(ConfigItem.HideIgnoreFiles)) { const rules = await Rules.forPath(this.path); items = rules.filter(this.path, items); }
-            if (config(ConfigItem.RemoveIgnoredFiles)) { items = items.filter((item) => item.alwaysShow); }
+
+            // ======= 重构后的直觉过滤逻辑 =======
+            const showHidden = config<boolean>(ConfigItem.ShowHidden) ?? false;
+
+            if (!showHidden) {
+                // 1. 过滤掉点号开头的隐藏文件
+                items = items.filter(item => !item.name.startsWith('.'));
+
+                // 2. 尊重 VS Code 原生的 files.exclude
+                const respectExcludes = config<boolean>(ConfigItem.RespectExcludes) ?? true;
+                if (respectExcludes) {
+                    const excludeSettings = vscode.workspace.getConfiguration('files').get<Record<string, boolean>>('exclude') || {};
+                    const excludePatterns = Object.keys(excludeSettings).filter(k => excludeSettings[k]);
+                    if (excludePatterns.length > 0) {
+                        const ig = require('ignore')().add(excludePatterns);
+                        items = items.filter(item => !ig.ignores(item.name));
+                    }
+                }
+
+                // 3. 尊重 .gitignore
+                const useGitIgnore = config<boolean>(ConfigItem.UseGitIgnore) ?? true;
+                if (useGitIgnore) {
+                    const rules = await Rules.forPath(this.path);
+                    items = rules.filter(this.path, items); // filter 直接剔除文件，不再搞花里胡哨的 label
+                }
+            }
             this.items = items;
         } else {
             this.items = [action("$(new-folder) Create this folder", Action.NewFolder)];
@@ -938,6 +961,19 @@ class FileBrowser {
     private debounce(func: () => void | Promise<void>, delay: number = 250) {
         this.searchTimeout = setTimeout(async () => { await func(); }, delay);
     }
+    getNativeExcludePatterns(): string {
+        const filesExclude = vscode.workspace.getConfiguration('files').get<Record<string, boolean>>('exclude') || {};
+        const searchExclude = vscode.workspace.getConfiguration('search').get<Record<string, boolean>>('exclude') || {};
+
+        const patterns = [
+            ...Object.keys(filesExclude).filter(k => filesExclude[k]),
+            ...Object.keys(searchExclude).filter(k => searchExclude[k]),
+            ...config<string[]>(ConfigItem.SearchExcludePattern) || []
+        ];
+
+        if (patterns.length === 0) return '**/node_modules/**';
+        return `{${Array.from(new Set(patterns)).join(',')}}`;
+    }
 
     async handleTextSearch(query: string, isGlobal: boolean) {
         if (query.length < 2) { this.current.items = [{ label: "Type at least 2 chars to search text...", name: "", alwaysShow: true } as FileItem]; return; }
@@ -954,12 +990,8 @@ class FileBrowser {
                     }
                 }
             } else {
-                const excludeArray = config<string[]>(ConfigItem.SearchExcludePattern) || [];
-                let excludePattern: string | undefined = undefined;
-                if (excludeArray.length > 0) {
-                    excludePattern = `{${excludeArray.join(',')}}`;
-                }
-                const files = await vscode.workspace.findFiles('**/*', excludePattern, 250);
+                const excludes = this.getNativeExcludePatterns();
+                const files = await vscode.workspace.findFiles('**/*', excludes, 250);
                 if (this.searchToken !== token) return;
                 const decoder = new TextDecoder('utf-8'); const batchSize = 10;
                 for (let i = 0; i < files.length; i += batchSize) {
@@ -1075,7 +1107,9 @@ class FileBrowser {
         const token = ++this.searchToken; query = query.trim(); if (query.length < 2) { this.current.items = [{ label: "Type at least 2 chars to search...", name: "", alwaysShow: true } as FileItem]; return; }
         this.current.busy = true;
         try {
-            const globPattern = toCaseInsensitiveGlob(query); const files = await vscode.workspace.findFiles(`**/*${globPattern}*`, '**/node_modules/**', 50);
+            const globPattern = toCaseInsensitiveGlob(query);
+            const excludes = this.getNativeExcludePatterns();
+            const files = await vscode.workspace.findFiles(`**/*${globPattern}*`, excludes, 50);
             if (this.searchToken !== token) return;
             this.current.items = files.map(uri => {
                 const relToCurrent = this.getRelativeDisplayPath(uri);

@@ -16,7 +16,7 @@ export class FileItem implements QuickPickItem {
         const [name, fileType] = record;
         this.name = name;
         this.fileType = fileType;
-        this.alwaysShow = config(ConfigItem.HideDotfiles) ? !name.startsWith(".") : true;
+        this.alwaysShow = true;
         switch (this.fileType) {
             case FileType.Directory:
                 this.label = `$(folder) ${name}`;

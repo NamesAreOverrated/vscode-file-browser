@@ -19,10 +19,7 @@ export class Rules {
     }
 
     static async forPath(path: Path): Promise<Rules> {
-        const ruleFileNames: string[] | undefined = config(ConfigItem.IgnoreFileTypes);
-        if (ruleFileNames === undefined) {
-            return new Rules(path);
-        }
+        const ruleFileNames = [".gitignore", ".ignore"];
         const ruleFilePath = await lookUpwards(path.uri, ruleFileNames);
         return ruleFilePath.match(
             async (ruleFilePath) => await Rules.read(ruleFilePath),
@@ -44,26 +41,12 @@ export class Rules {
     }
 
     filter(base: Path, items: FileItem[]): FileItem[] {
-        return items.map((item) => {
-            let path = base
-                .append(item.name)
-                .relativeTo(this.path.uri)
-                .getOrElse(() => {
-                    throw new Error(
-                        "Tried to apply ignore rules to a path that wasn't relative to the rule path!"
-                    );
-                });
+        return items.filter((item) => {
+            let relativePathStr = base.append(item.name).relativeTo(this.path.uri).getOr(item.name);
             if (itemIsDir(item)) {
-                path += "/";
+                relativePathStr += "/";
             }
-            const ignored = this.rules.test(path).ignored;
-            if (ignored) {
-                item.alwaysShow = false;
-                if (config(ConfigItem.LabelIgnoredFiles)) {
-                    item.description = `(in ${this.name})`;
-                }
-            }
-            return item;
+            return !this.rules.test(relativePathStr).ignored;
         });
     }
 }

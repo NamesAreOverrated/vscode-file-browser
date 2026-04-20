@@ -32,37 +32,103 @@
         "configuration": {
             "title": "File Browser",
             "properties": {
-                "file-browser.removeIgnoredFiles": {
-                    "markdownDescription": "Never show or match files that are hidden when matching by either `#file-browser.hideIgnoredFiles#` or `#file-browser.hideDotfiles#`.",
+                "file-browser.showHidden": {
                     "type": "boolean",
-                    "default": false
+                    "default": false,
+                    "description": "Show hidden files (starting with a dot) and ignored files. When false, the following filters are applied."
                 },
-                "file-browser.hideDotfiles": {
-                    "markdownDescription": "When filtering by name, hide unmatched dotfiles (files whose names start with `.`).",
+                "file-browser.useGitIgnore": {
                     "type": "boolean",
-                    "default": true
+                    "default": true,
+                    "description": "Automatically hide files listed in .gitignore or .ignore files."
                 },
-                "file-browser.hideIgnoredFiles": {
-                    "markdownDescription": "When filtering by name, hide unmatched files according to rules in `.gitignore` style files, as defined in `#file-browser.ignoreFileTypes#`.",
+                "file-browser.respectVSCodeExcludes": {
                     "type": "boolean",
-                    "default": false
+                    "default": true,
+                    "description": "Hide files that are excluded by VS Code's native 'files.exclude' setting."
                 },
-                "file-browser.labelIgnoredFiles": {
-                    "markdownDescription": "Label files hidden by a `.gitignore` file as such.",
-                    "type": "boolean",
-                    "default": false
-                },
-                "file-browser.ignoreFileTypes": {
-                    "markdownDescription": "A list of `.gitignore` style files to look for and hide files accordingly when browsing. The extension will obey only the first file it finds from this list, searching upwards from the current directory, so make sure the order is as you like it.",
+                "file-browser.searchExcludePattern": {
                     "type": "array",
                     "items": {
                         "type": "string"
                     },
                     "default": [
-                        ".gitignore",
-                        ".npmignore",
-                        ".vscodeignore"
-                    ]
+                        "**/node_modules/**",
+                        "**/.git/**",
+                        "**/dist/**",
+                        "**/build/**",
+                        "**/.next/**",
+                        "**/.cache/**",
+                        "**/.vscode/**",
+                        "**/*.map",
+                        "**/*.min.js",
+                        "**/*.min.css",
+                        "**/package-lock.json",
+                        "**/yarn.lock",
+                        "**/pnpm-lock.yaml",
+                        "**/*.lock",
+                        "**/*.log",
+                        "**/*.png",
+                        "**/*.jpg",
+                        "**/*.jpeg",
+                        "**/*.gif",
+                        "**/*.svg",
+                        "**/*.ico",
+                        "**/*.mp3",
+                        "**/*.mp4",
+                        "**/*.pdf",
+                        "**/*.exe",
+                        "**/*.dll"
+                    ],
+                    "description": "List of glob patterns to exclude during global text search ($$). Using an array makes it much easier to add or remove specific paths."
+                },
+                "file-browser.previewIgnoreExtensions": {
+                    "type": "array",
+                    "items": {
+                        "type": "string"
+                    },
+                    "default": [
+                        ".png",
+                        ".jpg",
+                        ".jpeg",
+                        ".gif",
+                        ".svg",
+                        ".ico",
+                        ".webp",
+                        ".bmp",
+                        ".mp4",
+                        ".mp3",
+                        ".wav",
+                        ".ogg",
+                        ".mkv",
+                        ".avi",
+                        ".webm",
+                        ".zip",
+                        ".tar",
+                        ".gz",
+                        ".rar",
+                        ".7z",
+                        ".tgz",
+                        ".pdf",
+                        ".doc",
+                        ".docx",
+                        ".xls",
+                        ".xlsx",
+                        ".ppt",
+                        ".pptx",
+                        ".exe",
+                        ".dll",
+                        ".so",
+                        ".dylib",
+                        ".bin",
+                        ".class",
+                        ".pyc",
+                        ".ttf",
+                        ".woff",
+                        ".woff2",
+                        ".eot"
+                    ],
+                    "description": "File extensions that should NOT be previewed when navigating the list."
                 }
             }
         },
