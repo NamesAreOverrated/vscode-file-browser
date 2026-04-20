@@ -190,6 +190,18 @@ export async function expandPaths(
     const isDirHint = pattern.endsWith('/') || pattern.endsWith('\\');
     pattern = pattern.replace(/\\/g, '/');
 
+    // ======== 新增：如果以 ~ 开头，解析为工作区根目录 ========
+    if (pattern.startsWith('~')) {
+        const folders = vscode.workspace.workspaceFolders;
+        if (folders && folders.length > 0) {
+            baseUri = folders[0].uri;
+            pattern = pattern.substring(1);
+            if (pattern.startsWith('/')) {
+                pattern = pattern.substring(1);
+            }
+        }
+    }
+
     const patterns = expandBraces(pattern);
     const results: ExpandedPath[] = [];
     const seen = new Set<string>();
@@ -522,7 +534,7 @@ class FileBrowser {
         this.current.onDidChangeValue(this.onDidChangeValue.bind(this));
         this.current.onDidTriggerButton(this.onDidTriggerButton.bind(this));
         this.update().then(() => {
-            this.current.placeholder = "Type a file name, paths, or commands (@@, @, $$, $, ^, etc.)";
+            this.current.placeholder = "Type a file name, paths, or commands (@@, @, $$, $, ^, >d, >r, etc.)";
             this.current.busy = false;
         });
         this.current.onDidChangeActive(items => { this.preview(items[0]); });
@@ -569,7 +581,6 @@ class FileBrowser {
 
                 if (stat.type & FileType.Directory) return;
 
-                // 智能拦截：文件大小限制 (例如 > 2MB 则不预览，防止卡死)
                 if (stat.size > 2 * 1024 * 1024) {
                     this.clearDecorations();
                     return;
@@ -778,7 +789,6 @@ class FileBrowser {
         this.closePreviewTab();
         this.clearDecorations();
 
-        // 还原所有被扰乱过的非目标编辑器光标位置
         for (const state of this.touchedEditors.values()) {
             if (this.exemptTarget && state.uri.toString() === this.exemptTarget.uri && state.viewColumn === this.exemptTarget.column) {
                 continue;
@@ -789,7 +799,6 @@ class FileBrowser {
             this.restoreEditorState(state, true);
         }
 
-        // 原始主窗口的处理
         if (this.editorUri && this.originalSelection) {
             const isExempt = this.exemptTarget && (this.editorUri.toString() === this.exemptTarget.uri && this.originalViewColumn === this.exemptTarget.column);
             if (!isExempt) {
@@ -798,7 +807,7 @@ class FileBrowser {
                     viewColumn: this.originalViewColumn || vscode.ViewColumn.Active,
                     selection: this.originalSelection,
                     visibleRanges: this.originalVisibleRanges || []
-                }, this.accepted); // 如果用户主动确认跳转至某处，保持还原但不强夺焦点；如果是退出取消，强行夺回焦点
+                }, this.accepted);
             }
         }
 
@@ -828,6 +837,8 @@ class FileBrowser {
             this.items = [
                 action("$(file) Open this file", Action.OpenFile, this.targetPayload),
                 action("$(split-horizontal) Open this file to the side", Action.OpenFileBeside, this.targetPayload),
+                action("$(link-external) Open file externally", Action.OpenExternally, this.targetPayload),
+                action("$(folder-opened) Reveal in OS", Action.RevealInExplorer, this.targetPayload),
                 action("$(edit) Rename this file", Action.RenameFile),
                 action("$(trash) Delete this file", Action.DeleteFile),
             ];
@@ -835,7 +846,9 @@ class FileBrowser {
             this.items = [
                 action("$(folder-opened) Open this folder", Action.OpenFolder),
                 action("$(folder-opened) Open this folder in a new window", Action.OpenFolderInNewWindow),
-                action("$(terminal) Open terminal here", Action.OpenTerminal),
+                action("$(terminal) Open terminal here", Action.OpenTerminal, this.targetPayload),
+                action("$(folder-opened) Reveal in OS", Action.RevealInExplorer, this.targetPayload),
+                action("$(link-external) Open folder externally", Action.OpenExternally, this.targetPayload),
                 action("$(edit) Rename this folder", Action.RenameFile),
                 action("$(trash) Delete this folder", Action.DeleteFile),
             ];
@@ -900,9 +913,25 @@ class FileBrowser {
 
     async onDidChangeValue(value: string) {
         if (this.isRestoringState || this.inActions) return;
+
+        // ======== 新增：~~ 快捷跳回第一个工作区根目录 ========
+        if (value === "~~") {
+            const wsf = vscode.workspace.workspaceFolders?.[0];
+            if (wsf) {
+                this.current.value = "";
+                this.pushState();
+                this.path = new Path(wsf.uri);
+                this.file = None;
+                this.inActions = false;
+                await this.update();
+            }
+            return;
+        }
+
         ++this.searchToken;
         if (this.searchTimeout) { clearTimeout(this.searchTimeout); this.searchTimeout = undefined; }
         if (value === "") { this.current.busy = false; this.current.items = this.items; this.current.activeItems = []; return; }
+
         if (value.startsWith("$$")) return this.debounce(() => this.handleTextSearch(value.substring(2), true));
         if (value.startsWith("$")) return this.debounce(() => this.handleTextSearch(value.substring(1), false));
         if (value.startsWith("%%")) return this.debounce(() => this.handleDiagnosticSearch(value.substring(2), true));
@@ -913,12 +942,18 @@ class FileBrowser {
         if (value.startsWith("!")) return this.debounce(() => this.handleGlobalFileSearch(value.substring(1)));
         if (value.startsWith("#")) return this.debounce(() => this.handleGlobalFolderSearch(value.substring(1)));
         if (value.startsWith(">t")) return this.debounce(() => this.handleTerminalCommand(value.substring(2)));
+        if (value.startsWith(">d")) return this.debounce(() => this.handleRevealCommand(value.substring(2)));
+        if (value.startsWith(">r")) return this.debounce(() => this.handleOpenExternallyCommand(value.substring(2)));
+
         if (value.match(/^[rdcm]:/)) {
             const m: { [k: string]: Action } = { 'r': Action.BulkRename, 'd': Action.BulkDelete, 'c': Action.BulkCopy, 'm': Action.BulkMove };
             return this.debounce(() => this.handleBulkOp(value, m[value[0]]));
         }
+
         if (value.includes("{") || value.includes("*") || value.includes("?")) { return this.debounce(() => this.handleGlobAndCreateSearch(value)); }
-        if (value.includes("/")) { return this.debounce(() => this.handlePathSearch(value), 100); }
+
+        // ======== 新增：如果包括 ~ 或者 / ，则触发路径补全 / 搜索 ========
+        if (value.includes("/") || value.startsWith("~")) { return this.debounce(() => this.handlePathSearch(value), 100); }
 
         const query = value.toLowerCase();
         let displayItems = this.items.filter((item) => {
@@ -936,19 +971,16 @@ class FileBrowser {
     private debounce(func: () => void | Promise<void>, delay: number = 250) {
         this.searchTimeout = setTimeout(async () => { await func(); }, delay);
     }
-    // 新增：专门负责读取并过滤当前目录的文件列表
     private async getDirectoryItems(dirUri: Uri): Promise<FileItem[]> {
         const records = await vscode.workspace.fs.readDirectory(dirUri);
         records.sort(fileRecordCompare);
         let items = records.map(entry => new FileItem(entry));
 
-        // 1. 过滤隐藏文件 (. 开头)
         const excludeHidden = config<boolean>(ConfigItem.ExplorerExcludeHidden) ?? false;
         if (excludeHidden) {
             items = items.filter(item => !item.name.startsWith('.'));
         }
 
-        // 2. 过滤 VS Code 配置 (files.exclude)
         const excludeVSCode = config<boolean>(ConfigItem.ExplorerExcludeVSCodeFiles) ?? false;
         if (excludeVSCode) {
             const excludeSettings = vscode.workspace.getConfiguration('files', dirUri).get<Record<string, boolean>>('exclude') || {};
@@ -956,8 +988,6 @@ class FileBrowser {
 
             if (excludePatterns.length > 0) {
                 const ig = ignore().add(excludePatterns);
-
-                // 为了精确匹配，我们需要获取当前目录相对于工作区根目录的路径
                 const workspaceFolder = vscode.workspace.getWorkspaceFolder(dirUri);
                 let relDirPath = "";
                 if (workspaceFolder) {
@@ -969,27 +999,23 @@ class FileBrowser {
 
                 items = items.filter(item => {
                     const isFolder = itemIsDir(item);
-                    // 组合完整相对路径，如果是文件夹则加上结尾的 '/' 帮助 ignore 库识别
                     const fullRelPath = relDirPath + item.name + (isFolder ? '/' : '');
                     return !ig.ignores(fullRelPath);
                 });
             }
         }
 
-        // 3. 过滤 .gitignore 规则
         const excludeGit = config<boolean>(ConfigItem.ExplorerExcludeGitIgnore) ?? false;
         if (excludeGit) {
             try {
                 const rules = await Rules.forPath(this.path);
                 items = rules.filter(this.path, items);
             } catch (e) {
-                // 如果解析失败，静默容错，不破坏文件列表的显示
             }
         }
 
         return items;
     }
-    // 新增：统一获取 GitIgnore 规则实例
     private async getGitIgnoreRules(): Promise<Rules | undefined> {
         const respectGit = config<boolean>(ConfigItem.SearchRespectGitIgnore) ?? true;
         if (!respectGit) return undefined;
@@ -1000,14 +1026,12 @@ class FileBrowser {
         }
     }
 
-    // 重构：专心只返回 VS Code 设置和自定义的 Glob
     async getSearchExcludeGlob(): Promise<string | undefined> {
         const respect = config<boolean>(ConfigItem.SearchRespectExcludes) ?? true;
         const customPatterns = config<string[]>(ConfigItem.SearchExcludePatterns) || [];
 
         const patterns: Set<string> = new Set(customPatterns);
 
-        // 获取 VS Code 原生设置的排除
         if (respect) {
             const filesExclude = vscode.workspace.getConfiguration('files').get<Record<string, boolean>>('exclude') || {};
             const searchExclude = vscode.workspace.getConfiguration('search').get<Record<string, boolean>>('exclude') || {};
@@ -1017,7 +1041,6 @@ class FileBrowser {
 
         const uniquePatterns = Array.from(patterns).filter(p => !!p);
 
-        // 注意：如果不传排除项，最好返回 undefined，这样可以让 vscode 使用默认行为
         if (uniquePatterns.length === 0) return undefined;
         if (uniquePatterns.length === 1) return uniquePatterns[0];
         return `{${uniquePatterns.join(',')}}`;
@@ -1244,6 +1267,7 @@ class FileBrowser {
         }
 
     }
+
     async handleTerminalCommand(query: string) {
         const token = ++this.searchToken;
         const queryTrim = query.trim();
@@ -1271,6 +1295,97 @@ class FileBrowser {
                 alwaysShow: true,
                 action: Action.OpenTerminal as any,
                 payload: { uri: d.uri }
+            } as FileItem));
+
+            items.push(...searchItems);
+        } catch (e) { }
+
+        if (this.searchToken === token) {
+            this.current.items = items;
+            if (items.length > 0) this.current.activeItems = [queryTrim ? (items[1] || items[0]) : items[0]];
+            this.current.busy = false;
+        }
+    }
+
+    // ======== 新增：>d Reveal in Explorer 命令 ========
+    async handleRevealCommand(query: string) {
+        const token = ++this.searchToken;
+        const queryTrim = query.trim();
+        this.current.busy = true;
+
+        const items: FileItem[] = [];
+
+        items.push({
+            label: `$(folder-opened) Reveal Current Folder in OS`,
+            description: `./ (${this.path.fsPath})`,
+            name: ">d",
+            alwaysShow: true,
+            action: Action.RevealInExplorer as any,
+            payload: { uri: this.path.uri }
+        } as FileItem);
+
+        try {
+            const results = await expandPaths(this.path.uri, queryTrim, { fuzzy: true, onlyExisting: true, maxDepth: 3 });
+            if (this.searchToken !== token) return;
+
+            const searchItems = results.map(r => ({
+                label: `$(folder-opened) Reveal in OS: ${r.name}`,
+                description: vscode.workspace.asRelativePath(r.uri),
+                name: r.name,
+                alwaysShow: true,
+                action: Action.RevealInExplorer as any,
+                payload: { uri: r.uri }
+            } as FileItem));
+
+            items.push(...searchItems);
+        } catch (e) { }
+
+        if (this.searchToken === token) {
+            this.current.items = items;
+            if (items.length > 0) this.current.activeItems = [queryTrim ? (items[1] || items[0]) : items[0]];
+            this.current.busy = false;
+        }
+    }
+
+    // ======== 新增：>r Open Externally 命令 ========
+    async handleOpenExternallyCommand(query: string) {
+        const token = ++this.searchToken;
+        const queryTrim = query.trim();
+        this.current.busy = true;
+
+        const items: FileItem[] = [];
+
+        if (!queryTrim && this.editorUri && OSPath.dirname(this.editorUri.fsPath) === OSPath.normalize(this.path.uri.fsPath)) {
+            items.push({
+                label: `$(link-external) Open Current File Externally`,
+                description: OSPath.basename(this.editorUri.fsPath),
+                name: ">r",
+                alwaysShow: true,
+                action: Action.OpenExternally as any,
+                payload: { uri: this.editorUri }
+            } as FileItem);
+        }
+
+        items.push({
+            label: `$(link-external) Open Current Folder Externally`,
+            description: `./ (${this.path.fsPath})`,
+            name: ">r",
+            alwaysShow: true,
+            action: Action.OpenExternally as any,
+            payload: { uri: this.path.uri }
+        } as FileItem);
+
+        try {
+            const results = await expandPaths(this.path.uri, queryTrim, { fuzzy: true, onlyExisting: true, maxDepth: 3 });
+            if (this.searchToken !== token) return;
+
+            const searchItems = results.map(r => ({
+                label: `$(link-external) Open Externally: ${r.name}`,
+                description: vscode.workspace.asRelativePath(r.uri),
+                name: r.name,
+                alwaysShow: true,
+                action: Action.OpenExternally as any,
+                payload: { uri: r.uri }
             } as FileItem));
 
             items.push(...searchItems);
@@ -1553,10 +1668,7 @@ class FileBrowser {
             this.closePreviewTab();
         }
 
-        // 我们设置一个目标例外：当 dispose() 执行清扫时，不要重置这组目标的状态
         this.exemptTarget = { uri: uriStr, column: targetColumn };
-
-        // 因为不再依赖阻断，交给 dispose 去执行非常安全的所有其它编辑器的复原工作
         this.dispose();
 
         vscode.workspace.openTextDocument(uri).then((doc) => {
@@ -1728,8 +1840,26 @@ class FileBrowser {
                     break;
                 }
                 case Action.OpenTerminal: {
-                    const uri = item.payload?.uri;
+                    const uri = item.payload instanceof Uri ? item.payload : (item.payload?.uri || this.path.uri);
                     this.openTerminal(uri);
+                    break;
+                }
+                case Action.RevealInExplorer: {
+                    let uri = this.path.uri;
+                    if (item.payload instanceof Uri) uri = item.payload;
+                    else if (item.payload?.uri) uri = item.payload.uri;
+                    vscode.commands.executeCommand("revealFileInOS", uri);
+                    this.accepted = true;
+                    this.dispose();
+                    break;
+                }
+                case Action.OpenExternally: {
+                    let uri = this.path.uri;
+                    if (item.payload instanceof Uri) uri = item.payload;
+                    else if (item.payload?.uri) uri = item.payload.uri;
+                    vscode.env.openExternal(uri);
+                    this.accepted = true;
+                    this.dispose();
                     break;
                 }
                 case Action.RenameFile: { this.keepAlive = true; this.hide(); await this.rename(); this.show(); this.keepAlive = false; await this.popState(); break; }
@@ -1746,7 +1876,8 @@ class FileBrowser {
         const val = this.current.value;
         if (!val) return;
 
-        const cmdMatch = val.match(/^([rdcm]:|#|>t|!|@@|@|\$\$?|%%?|:)\s*/);
+        // ======== 更新：防止匹配新指令 ========
+        const cmdMatch = val.match(/^([rdcm]:|#|>t|>d|>r|!|@@|@|\$\$?|%%?|:)\s*/);
         const cmdPrefix = cmdMatch ? cmdMatch[0] : "";
         const argsStr = val.substring(cmdPrefix.length);
 
@@ -1783,9 +1914,12 @@ class FileBrowser {
             return;
         }
 
+        // ======== 更新：防止 tab 到新指令的虚拟项 ========
         const validItems = this.current.items.filter(item =>
             item.name &&
             item.name !== ">t" &&
+            item.name !== ">d" &&
+            item.name !== ">r" &&
             !item.label.includes("Create Pattern:") &&
             !item.label.includes("Open / Create Path:")
         );

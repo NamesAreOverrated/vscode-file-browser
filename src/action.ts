@@ -8,6 +8,8 @@ export enum Action {
     OpenFolder,
     OpenFolderInNewWindow,
     OpenTerminal,
+    RevealInExplorer,
+    OpenExternally,
 
     // ======== 批量/搜索 Action ========
     GoToLine,
