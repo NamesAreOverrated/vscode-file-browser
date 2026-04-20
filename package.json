@@ -32,22 +32,27 @@
         "configuration": {
             "title": "File Browser",
             "properties": {
-                "file-browser.showHidden": {
+                "file-browser.explorer.excludeHidden": {
                     "type": "boolean",
                     "default": false,
-                    "description": "Show hidden files (starting with a dot) and ignored files. When false, the following filters are applied."
+                    "description": "[List View] Hide dot-files (e.g. .git, .env) from the file browser list. Default is false (show everything)."
                 },
-                "file-browser.useGitIgnore": {
+                "file-browser.explorer.excludeGitIgnore": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "[List View] Hide files ignored by .gitignore in the file browser list. Default is false (show everything so you can manage them)."
+                },
+                "file-browser.explorer.excludeVSCodeFiles": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "[List View] Hide files defined in VS Code's 'files.exclude' from the file browser list. Default is false."
+                },
+                "file-browser.search.respectVSCodeExcludes": {
                     "type": "boolean",
                     "default": true,
-                    "description": "Automatically hide files listed in .gitignore or .ignore files."
+                    "description": "[Search] Exclude files matching VS Code's 'files.exclude' and 'search.exclude' when doing global/text searches (## , ! , etc)."
                 },
-                "file-browser.respectVSCodeExcludes": {
-                    "type": "boolean",
-                    "default": true,
-                    "description": "Hide files that are excluded by VS Code's native 'files.exclude' setting."
-                },
-                "file-browser.searchExcludePattern": {
+                "file-browser.search.excludePatterns": {
                     "type": "array",
                     "items": {
                         "type": "string"
@@ -80,7 +85,7 @@
                         "**/*.exe",
                         "**/*.dll"
                     ],
-                    "description": "List of glob patterns to exclude during global text search ($$). Using an array makes it much easier to add or remove specific paths."
+                    "description": "[Search] Heavy glob patterns to always exclude during global text/file searches to prevent lag."
                 },
                 "file-browser.previewIgnoreExtensions": {
                     "type": "array",

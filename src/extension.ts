@@ -443,13 +443,15 @@ async function findDirectoriesSmart(baseUri: Uri, query: string, token: number, 
 // ================= 配置与上下文 =================
 
 export enum ConfigItem {
-    ShowHidden = "showHidden",
-    UseGitIgnore = "useGitIgnore",
-    RespectExcludes = "respectVSCodeExcludes",
-    SearchExcludePattern = "searchExcludePattern",
+    ExplorerExcludeHidden = "explorer.excludeHidden",
+    ExplorerExcludeGitIgnore = "explorer.excludeGitIgnore",
+    ExplorerExcludeVSCodeFiles = "explorer.excludeVSCodeFiles",
+
+    SearchRespectExcludes = "search.respectVSCodeExcludes",
+    SearchExcludePatterns = "search.excludePatterns",
+
     PreviewIgnoreExtensions = "previewIgnoreExtensions",
 }
-
 
 export function config<A>(item: ConfigItem): A | undefined {
     return vscode.workspace.getConfiguration("file-browser").get(item);
@@ -840,30 +842,25 @@ class FileBrowser {
             records.sort(fileRecordCompare);
             let items = records.map((entry) => new FileItem(entry));
 
-            // ======= 重构后的直觉过滤逻辑 =======
-            const showHidden = config<boolean>(ConfigItem.ShowHidden) ?? false;
-
-            if (!showHidden) {
-                // 1. 过滤掉点号开头的隐藏文件
+            const excludeHidden = config<boolean>(ConfigItem.ExplorerExcludeHidden) ?? false;
+            if (excludeHidden) {
                 items = items.filter(item => !item.name.startsWith('.'));
+            }
 
-                // 2. 尊重 VS Code 原生的 files.exclude
-                const respectExcludes = config<boolean>(ConfigItem.RespectExcludes) ?? true;
-                if (respectExcludes) {
-                    const excludeSettings = vscode.workspace.getConfiguration('files').get<Record<string, boolean>>('exclude') || {};
-                    const excludePatterns = Object.keys(excludeSettings).filter(k => excludeSettings[k]);
-                    if (excludePatterns.length > 0) {
-                        const ig = require('ignore')().add(excludePatterns);
-                        items = items.filter(item => !ig.ignores(item.name));
-                    }
+            const excludeVSCode = config<boolean>(ConfigItem.ExplorerExcludeVSCodeFiles) ?? false;
+            if (excludeVSCode) {
+                const excludeSettings = vscode.workspace.getConfiguration('files').get<Record<string, boolean>>('exclude') || {};
+                const excludePatterns = Object.keys(excludeSettings).filter(k => excludeSettings[k]);
+                if (excludePatterns.length > 0) {
+                    const ig = require('ignore')().add(excludePatterns);
+                    items = items.filter(item => !ig.ignores(item.name));
                 }
+            }
 
-                // 3. 尊重 .gitignore
-                const useGitIgnore = config<boolean>(ConfigItem.UseGitIgnore) ?? true;
-                if (useGitIgnore) {
-                    const rules = await Rules.forPath(this.path);
-                    items = rules.filter(this.path, items); // filter 直接剔除文件，不再搞花里胡哨的 label
-                }
+            const excludeGit = config<boolean>(ConfigItem.ExplorerExcludeGitIgnore) ?? false;
+            if (excludeGit) {
+                const rules = await Rules.forPath(this.path);
+                items = rules.filter(this.path, items);
             }
             this.items = items;
         } else {
@@ -961,18 +958,23 @@ class FileBrowser {
     private debounce(func: () => void | Promise<void>, delay: number = 250) {
         this.searchTimeout = setTimeout(async () => { await func(); }, delay);
     }
-    getNativeExcludePatterns(): string {
-        const filesExclude = vscode.workspace.getConfiguration('files').get<Record<string, boolean>>('exclude') || {};
-        const searchExclude = vscode.workspace.getConfiguration('search').get<Record<string, boolean>>('exclude') || {};
+    getSearchExcludeGlob(): string {
+        const respect = config<boolean>(ConfigItem.SearchRespectExcludes) ?? true;
+        const customPatterns = config<string[]>(ConfigItem.SearchExcludePatterns) || [];
 
-        const patterns = [
-            ...Object.keys(filesExclude).filter(k => filesExclude[k]),
-            ...Object.keys(searchExclude).filter(k => searchExclude[k]),
-            ...config<string[]>(ConfigItem.SearchExcludePattern) || []
-        ];
+        const patterns: string[] = [...customPatterns];
 
-        if (patterns.length === 0) return '**/node_modules/**';
-        return `{${Array.from(new Set(patterns)).join(',')}}`;
+        if (respect) {
+            const filesExclude = vscode.workspace.getConfiguration('files').get<Record<string, boolean>>('exclude') || {};
+            const searchExclude = vscode.workspace.getConfiguration('search').get<Record<string, boolean>>('exclude') || {};
+            patterns.push(...Object.keys(filesExclude).filter(k => filesExclude[k]));
+            patterns.push(...Object.keys(searchExclude).filter(k => searchExclude[k]));
+        }
+
+        const uniquePatterns = Array.from(new Set(patterns.filter(p => !!p)));
+        if (uniquePatterns.length === 0) return '**/node_modules/**';
+        if (uniquePatterns.length === 1) return uniquePatterns[0];
+        return `{${uniquePatterns.join(',')}}`;
     }
 
     async handleTextSearch(query: string, isGlobal: boolean) {
@@ -990,7 +992,7 @@ class FileBrowser {
                     }
                 }
             } else {
-                const excludes = this.getNativeExcludePatterns();
+                const excludes = this.getSearchExcludeGlob();
                 const files = await vscode.workspace.findFiles('**/*', excludes, 250);
                 if (this.searchToken !== token) return;
                 const decoder = new TextDecoder('utf-8'); const batchSize = 10;
@@ -1108,7 +1110,7 @@ class FileBrowser {
         this.current.busy = true;
         try {
             const globPattern = toCaseInsensitiveGlob(query);
-            const excludes = this.getNativeExcludePatterns();
+            const excludes = this.getSearchExcludeGlob();
             const files = await vscode.workspace.findFiles(`**/*${globPattern}*`, excludes, 50);
             if (this.searchToken !== token) return;
             this.current.items = files.map(uri => {
