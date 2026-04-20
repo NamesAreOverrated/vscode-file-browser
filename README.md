@@ -1,57 +1,87 @@
 # File Browser Plus
 
-**The ultimate keyboard-driven file manager for VS Code.**
+File Browser Plus is a keyboard-driven file management extension for Visual Studio Code. It is designed to facilitate rapid navigation and manipulation of the file system through a unified command-line interface, reducing reliance on the mouse and the standard sidebar.
 
-Inspired by Emacs's [Helm](https://emacs-helm.github.io/helm/), this is a heavily enhanced fork of the original File Browser. It transforms the file selection process into a high-speed productivity tool with bulk operations, glob patterns, and advanced search modes.
+## Core Navigation and Path Shortcuts
 
+Navigation is primarily conducted using the arrow keys and the Enter key.
+- **Step Into/Accept**: Pressing the Right Arrow or Enter on a folder moves the browser into that directory. On a file, it opens the action menu or the file itself.
+- **Step Out**: Pressing the Left Arrow moves the browser to the parent directory.
+- **Root Shortcut (~~)**: Typing `~~` into the input field instantly resets the browser path to the first workspace root directory.
+- **Home/Workspace Path (~)**: Starting a path with `~` allows for navigation relative to the workspace root, regardless of the current directory location.
 
-## Key Enhancements (Power User Features)
+## Advanced Search and Navigation Modes
 
-While keeping the classic keyboard-first navigation, this version adds:
+The extension utilizes specific character prefixes to switch between different functional modes:
 
--   **Bulk Operations**: Execute file system actions on multiple files at once using a command prefix:
-    -   `r:from to`: **Rename** multiple files (supports wildcards, e.g., `r:*.js *.ts`).
-    -   `d:pattern`: **Delete** all files matching a pattern.
-    -   `c:pattern dest`: **Copy** matched files to a destination.
-    -   `m:pattern dest`: **Move** matched files to a destination.
--   **Glob & Brace Expansion**: Create or search multiple files instantly.
-    -   Type `src/{index,utils,types}.ts` to create three files at once.
-    -   Type `**/*.test.js` to find all test files in subdirectories.
--   **Contextual Search Modes**:
-    -   `@`: Search **Symbols** in the active document.
-    -   `:`: Go to **Line number**.
-    -   `!`: Global **File** search (workspace-wide).
-    -   `#`: Global **Folder** search.
--   **Deep Path Creation**: Type a non-existent path like `api/v1/user/service.ts` and hit enter; the extension will automatically perform a `mkdir -p` and create the file for you.
--   **Smarter Tab Completion**: Context-aware autocompletion that works across all search modes and command prefixes.
+- **Symbol Search (@ / @@)**: 
+  - `@`: Searches for symbols (functions, classes, variables) within the currently active document.
+  - `@@`: Performs a workspace-wide symbol search.
+- **Global Search (! / #)**:
+  - `!`: Searches for files across the entire workspace by name.
+  - `#`: Searches for directories across the entire workspace.
+- **Text Search ($ / $$)**:
+  - `$`: Searches for text strings within currently open documents.
+  - `$$`: Performs a global text search across workspace files.
+- **Line Navigation (:)**: Typing a colon followed by a number (e.g., `:45`) targets a specific line in the active file.
+- **Diagnostics (% / %%)**:
+  - `%`: Lists errors and warnings in the current file.
+  - `%%`: Lists all diagnostics across the workspace.
 
-## Basic Usage
+## Bulk Operations and Wildcard Transformation
 
--   **Open Browser**: Bind `file-browser.open` to `Ctrl+O` or `Alt+O`.
--   **Navigation**: 
-    -   `Right Arrow`: Step into a folder or view file actions.
-    -   `Left Arrow`: Step out to the parent folder.
-    -   `Tab`: Cycle through suggestions/autocompletion.
--   **Quick Rename**: Type `r:newname.js` while the browser is open to immediately rename the currently active file.
+Bulk operations allow for the simultaneous manipulation of multiple file system entries. These commands follow the syntax `prefix:source_pattern [target_pattern]`.
 
-## Command Cheat Sheet
+### Wildcard Replacement (*)
+The asterisk (`*`) is used for pattern matching and string transformation. During a bulk rename or copy operation, the `*` in the target pattern is replaced by the string matched by the `*` in the source pattern. 
+- **Example**: `r:old_*.js new_*.js`
+  This command will rename `old_data.js` to `new_data.js` and `old_test.js` to `new_test.js`.
 
-| Prefix | Action | Example |
+### Command Prefixes
+- **r:** (Rename): Renames files matching the source pattern. If only one argument is provided, it renames the currently active file.
+- **d:** (Delete): Deletes all files and folders matching the specified pattern.
+- **c:** (Copy): Copies matched files to the destination. If the destination ends with a `/`, it is treated as a directory.
+- **m:** (Move): Moves matched files to the destination.
+
+## Pattern Expansion and Creation
+
+The extension supports glob patterns and brace expansion for both searching and creating files.
+
+- **Brace Expansion**: Typing `src/{app,utils}.ts` identifies or creates both `src/app.ts` and `src/utils.ts`. 
+- **Deep Creation**: If a path is entered that does not exist (e.g., `new_folder/sub/file.txt`), the extension will recursively create all necessary parent directories upon execution.
+- **Numeric Ranges**: Supports sequences such as `data{01..05}.json`, which expands to five numbered files.
+
+## Command Reference Table
+
+| Prefix | Function | Example |
 | :--- | :--- | :--- |
-| `r:` | Bulk Rename / Quick Rename | `r:*.old *.new` or `r:style.css` |
-| `d:` | Bulk Delete | `d:temp_*` |
-| `c:` | Bulk Copy | `c:*.json ./backup` |
-| `m:` | Bulk Move | `m:*.log ./logs` |
-| `@` | Symbol Search | `@handleSubmit` |
-| `:` | Go to Line | `:42` |
-| `!` | Workspace File Search | `!app.config` |
-| `#` | Workspace Folder Search | `#controllers` |
+| `~` | Workspace Root Path | `~/src/main.ts` |
+| `~~` | Jump to Root | `~~` |
+| `r:` | Bulk/Quick Rename | `r:*.txt *.log` |
+| `d:` | Bulk Delete | `d:*.tmp` |
+| `c:` | Bulk Copy | `c:config.json ./backup/` |
+| `m:` | Bulk Move | `m:*.js ./scripts/` |
+| `@` | Document Symbols | `@init` |
+| `@@` | Workspace Symbols | `@@UserService` |
+| `!` | Workspace File Search | `!index.html` |
+| `#` | Workspace Folder Search | `#assets` |
+| `$` | Open Files Text Search | `$TODO` |
+| `$$` | Global Text Search | `$$functionName` |
+| `:` | Go to Line | `:120` |
+| `>t` | Terminal at Path | `>t folder_name` |
+| `>d` | Reveal in OS | `>d` |
+
+## System Constraints and Safety
+
+- **Path Safety**: Operations are restricted to the current workspace boundaries to prevent accidental modification of system files.
+- **Gitignore Respect**: The extension optionally filters results based on `.gitignore` and `.ignore` files located within the workspace.
+- **Confirmation**: Destructive actions, such as bulk deletions or overwriting existing files, require explicit user confirmation via a modal dialog.
 
 ---
 
 ## Licence & Credits
 
-**File Browser Plus** is a fork of the original `vscode-file-browser` created by **Bodil Stokke**.
+**File Browser Plus** is a fork of the original [vscode-file-browser](https://github.com/bodil/vscode-file-browser) created by **Bodil Stokke**.
 
 Copyright 2020 [Bodil Stokke]
 
