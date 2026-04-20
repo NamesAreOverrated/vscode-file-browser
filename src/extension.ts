@@ -840,31 +840,7 @@ class FileBrowser {
                 action("$(trash) Delete this folder", Action.DeleteFile),
             ];
         } else if (stat && (stat.type & FileType.Directory) === FileType.Directory) {
-            const records = await vscode.workspace.fs.readDirectory(this.path.uri);
-            records.sort(fileRecordCompare);
-            let items = records.map((entry) => new FileItem(entry));
-
-            const excludeHidden = config<boolean>(ConfigItem.ExplorerExcludeHidden) ?? false;
-            if (excludeHidden) {
-                items = items.filter(item => !item.name.startsWith('.'));
-            }
-
-            const excludeVSCode = config<boolean>(ConfigItem.ExplorerExcludeVSCodeFiles) ?? false;
-            if (excludeVSCode) {
-                const excludeSettings = vscode.workspace.getConfiguration('files').get<Record<string, boolean>>('exclude') || {};
-                const excludePatterns = Object.keys(excludeSettings).filter(k => excludeSettings[k]);
-                if (excludePatterns.length > 0) {
-                    const ig = ignore().add(excludePatterns);
-                    items = items.filter(item => !ig.ignores(item.name));
-                }
-            }
-
-            const excludeGit = config<boolean>(ConfigItem.ExplorerExcludeGitIgnore) ?? false;
-            if (excludeGit) {
-                const rules = await Rules.forPath(this.path);
-                items = rules.filter(this.path, items);
-            }
-            this.items = items;
+            this.items = await this.getDirectoryItems(this.path.uri);
         } else {
             this.items = [action("$(new-folder) Create this folder", Action.NewFolder)];
         }
@@ -960,7 +936,59 @@ class FileBrowser {
     private debounce(func: () => void | Promise<void>, delay: number = 250) {
         this.searchTimeout = setTimeout(async () => { await func(); }, delay);
     }
+    // 新增：专门负责读取并过滤当前目录的文件列表
+    private async getDirectoryItems(dirUri: Uri): Promise<FileItem[]> {
+        const records = await vscode.workspace.fs.readDirectory(dirUri);
+        records.sort(fileRecordCompare);
+        let items = records.map(entry => new FileItem(entry));
 
+        // 1. 过滤隐藏文件 (. 开头)
+        const excludeHidden = config<boolean>(ConfigItem.ExplorerExcludeHidden) ?? false;
+        if (excludeHidden) {
+            items = items.filter(item => !item.name.startsWith('.'));
+        }
+
+        // 2. 过滤 VS Code 配置 (files.exclude)
+        const excludeVSCode = config<boolean>(ConfigItem.ExplorerExcludeVSCodeFiles) ?? false;
+        if (excludeVSCode) {
+            const excludeSettings = vscode.workspace.getConfiguration('files', dirUri).get<Record<string, boolean>>('exclude') || {};
+            const excludePatterns = Object.keys(excludeSettings).filter(k => excludeSettings[k]);
+
+            if (excludePatterns.length > 0) {
+                const ig = ignore().add(excludePatterns);
+
+                // 为了精确匹配，我们需要获取当前目录相对于工作区根目录的路径
+                const workspaceFolder = vscode.workspace.getWorkspaceFolder(dirUri);
+                let relDirPath = "";
+                if (workspaceFolder) {
+                    const rel = OSPath.relative(workspaceFolder.uri.fsPath, dirUri.fsPath).replace(/\\/g, '/');
+                    if (rel && rel !== '..') {
+                        relDirPath = rel + '/';
+                    }
+                }
+
+                items = items.filter(item => {
+                    const isFolder = itemIsDir(item);
+                    // 组合完整相对路径，如果是文件夹则加上结尾的 '/' 帮助 ignore 库识别
+                    const fullRelPath = relDirPath + item.name + (isFolder ? '/' : '');
+                    return !ig.ignores(fullRelPath);
+                });
+            }
+        }
+
+        // 3. 过滤 .gitignore 规则
+        const excludeGit = config<boolean>(ConfigItem.ExplorerExcludeGitIgnore) ?? false;
+        if (excludeGit) {
+            try {
+                const rules = await Rules.forPath(this.path);
+                items = rules.filter(this.path, items);
+            } catch (e) {
+                // 如果解析失败，静默容错，不破坏文件列表的显示
+            }
+        }
+
+        return items;
+    }
     // 新增：统一获取 GitIgnore 规则实例
     private async getGitIgnoreRules(): Promise<Rules | undefined> {
         const respectGit = config<boolean>(ConfigItem.SearchRespectGitIgnore) ?? true;
