@@ -70,6 +70,7 @@ The extension supports glob patterns and brace expansion for both searching and 
 | `:` | Go to Line | `:120` |
 | `>t` | Terminal at Path | `>t folder_name` |
 | `>d` | Reveal in OS | `>d` |
+| `>r` | Open In External Program | `>r test.jpg` |
 
 ## System Constraints and Safety
 
