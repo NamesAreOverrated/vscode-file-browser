@@ -8,6 +8,7 @@ import { lookUpwards, Path } from "./path";
 import { Rules } from "./filter";
 import { FileItem, fileRecordCompare, itemIsDir } from "./fileitem";
 import { action, Action } from "./action";
+import ignore from "ignore"
 
 // ================= 安全性保险：防止路径逃逸 =================
 
@@ -853,7 +854,7 @@ class FileBrowser {
                 const excludeSettings = vscode.workspace.getConfiguration('files').get<Record<string, boolean>>('exclude') || {};
                 const excludePatterns = Object.keys(excludeSettings).filter(k => excludeSettings[k]);
                 if (excludePatterns.length > 0) {
-                    const ig = require('ignore')().add(excludePatterns);
+                    const ig = ignore().add(excludePatterns);
                     items = items.filter(item => !ig.ignores(item.name));
                 }
             }
@@ -959,14 +960,26 @@ class FileBrowser {
     private debounce(func: () => void | Promise<void>, delay: number = 250) {
         this.searchTimeout = setTimeout(async () => { await func(); }, delay);
     }
-    async getSearchExcludeGlob(): Promise<string> {
-        const respect = config<boolean>(ConfigItem.SearchRespectExcludes) ?? true;
+
+    // 新增：统一获取 GitIgnore 规则实例
+    private async getGitIgnoreRules(): Promise<Rules | undefined> {
         const respectGit = config<boolean>(ConfigItem.SearchRespectGitIgnore) ?? true;
+        if (!respectGit) return undefined;
+        try {
+            return await Rules.forPath(this.path);
+        } catch {
+            return undefined;
+        }
+    }
+
+    // 重构：专心只返回 VS Code 设置和自定义的 Glob
+    async getSearchExcludeGlob(): Promise<string | undefined> {
+        const respect = config<boolean>(ConfigItem.SearchRespectExcludes) ?? true;
         const customPatterns = config<string[]>(ConfigItem.SearchExcludePatterns) || [];
 
         const patterns: Set<string> = new Set(customPatterns);
 
-        // 1. 获取 VS Code 原生设置的排除
+        // 获取 VS Code 原生设置的排除
         if (respect) {
             const filesExclude = vscode.workspace.getConfiguration('files').get<Record<string, boolean>>('exclude') || {};
             const searchExclude = vscode.workspace.getConfiguration('search').get<Record<string, boolean>>('exclude') || {};
@@ -974,44 +987,10 @@ class FileBrowser {
             Object.keys(searchExclude).filter(k => searchExclude[k]).forEach(p => patterns.add(p));
         }
 
-        // 2. 获取 .gitignore 中的排除内容
-        if (respectGit) {
-            try {
-                // 寻找当前目录或上层目录的 .gitignore
-                const ruleFileNames = [".gitignore", ".ignore"];
-                const ruleFilePath = await lookUpwards(this.path.uri, ruleFileNames);
-
-                await ruleFilePath.match(
-                    async (uri) => {
-                        const content = (await vscode.workspace.fs.readFile(uri)).toString();
-                        const lines = content.split(/\r?\n/);
-                        for (let line of lines) {
-                            line = line.trim();
-                            // 过滤注释和空行
-                            if (!line || line.startsWith('#')) continue;
-
-                            // 简单的 gitignore 到 glob 的转换
-                            // 如果是目录 (以/结尾)，转为 **/name/**
-                            // 如果包含通配符，尝试保持原样或包裹
-                            if (line.endsWith('/')) {
-                                patterns.add(`**/${line}**`);
-                            } else if (line.startsWith('/')) {
-                                patterns.add(line.substring(1));
-                            } else {
-                                patterns.add(`**/${line}/**`);
-                                patterns.add(`**/${line}`);
-                            }
-                        }
-                    },
-                    async () => { } // 没找到 ignore 文件则忽略
-                );
-            } catch (e) {
-                // 容错处理
-            }
-        }
-
         const uniquePatterns = Array.from(patterns).filter(p => !!p);
-        if (uniquePatterns.length === 0) return '**/node_modules/**';
+
+        // 注意：如果不传排除项，最好返回 undefined，这样可以让 vscode 使用默认行为
+        if (uniquePatterns.length === 0) return undefined;
         if (uniquePatterns.length === 1) return uniquePatterns[0];
         return `{${uniquePatterns.join(',')}}`;
     }
@@ -1032,8 +1011,12 @@ class FileBrowser {
                 }
             } else {
                 const excludes = await this.getSearchExcludeGlob();
-                const files = await vscode.workspace.findFiles('**/*', excludes, 250);
+                let files = await vscode.workspace.findFiles('**/*', excludes, 250);
                 if (this.searchToken !== token) return;
+                const rules = await this.getGitIgnoreRules();
+                if (rules) {
+                    files = files.filter(uri => !rules.ignoresUri(uri));
+                }
                 const decoder = new TextDecoder('utf-8'); const batchSize = 10;
                 for (let i = 0; i < files.length; i += batchSize) {
                     if (this.searchToken !== token) return;
@@ -1126,7 +1109,14 @@ class FileBrowser {
             const symbols = await vscode.commands.executeCommand<vscode.SymbolInformation[]>('vscode.executeWorkspaceSymbolProvider', query);
             if (this.searchToken !== token) return; if (!symbols || symbols.length === 0) { this.current.items = [{ label: "No symbols found in workspace.", name: "", alwaysShow: true } as FileItem]; return; }
             const importantKinds = new Set([vscode.SymbolKind.Class, vscode.SymbolKind.Method, vscode.SymbolKind.Function, vscode.SymbolKind.Field, vscode.SymbolKind.Property, vscode.SymbolKind.Struct, vscode.SymbolKind.Interface, vscode.SymbolKind.Enum, vscode.SymbolKind.Event, vscode.SymbolKind.Constructor]);
-            const filtered = symbols.filter(s => importantKinds.has(s.kind));
+            let filtered = symbols.filter(s => importantKinds.has(s.kind));
+            const rules = await this.getGitIgnoreRules();
+            if (rules) {
+                filtered = filtered.filter(s => !rules.ignoresUri(s.location.uri));
+            }
+
+
+
             this.current.items = filtered.slice(0, 200).map(s => {
                 const container = s.containerName ? `${s.containerName} • ` : ''; const path = vscode.workspace.asRelativePath(s.location.uri);
                 return {
@@ -1150,8 +1140,12 @@ class FileBrowser {
         try {
             const globPattern = toCaseInsensitiveGlob(query);
             const excludes = await this.getSearchExcludeGlob();
-            const files = await vscode.workspace.findFiles(`**/*${globPattern}*`, excludes, 50);
+            let files = await vscode.workspace.findFiles(`**/*${globPattern}*`, excludes, 50);
             if (this.searchToken !== token) return;
+            const rules = await this.getGitIgnoreRules();
+            if (rules) {
+                files = files.filter(uri => !rules.ignoresUri(uri));
+            }
             this.current.items = files.map(uri => {
                 const relToCurrent = this.getRelativeDisplayPath(uri);
                 return {
