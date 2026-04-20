@@ -448,6 +448,8 @@ export enum ConfigItem {
     HideIgnoreFiles = "hideIgnoredFiles",
     IgnoreFileTypes = "ignoreFileTypes",
     LabelIgnoredFiles = "labelIgnoredFiles",
+    SearchExcludePattern = "searchExcludePattern",
+    PreviewIgnoreExtensions = "previewIgnoreExtensions",
 }
 
 export function config<A>(item: ConfigItem): A | undefined {
@@ -559,13 +561,32 @@ class FileBrowser {
 
             if (!uri) { this.clearDecorations(); return; }
 
-            try { const stat = await vscode.workspace.fs.stat(uri); if (stat.type & FileType.Directory) return; } catch (e) { return; }
+            try {
+                const stat = await vscode.workspace.fs.stat(uri);
+
+                if (stat.type & FileType.Directory) return;
+
+                // 智能拦截：文件大小限制 (例如 > 2MB 则不预览，防止卡死)
+                if (stat.size > 2 * 1024 * 1024) {
+                    this.clearDecorations();
+                    return;
+                }
+
+                const ignoreConfig = config<string[]>(ConfigItem.PreviewIgnoreExtensions) || [];
+                const ignorePreviewExts = new Set(ignoreConfig.map(ext => ext.startsWith('.') ? ext.toLowerCase() : `.${ext.toLowerCase()}`));
+
+                const ext = OSPath.extname(uri.fsPath).toLowerCase();
+                if (ignorePreviewExts.has(ext)) {
+                    this.clearDecorations();
+                    return;
+                }
+
+            } catch (e) { return; }
 
             const oldTab = this.currentPreviewTab;
             this.clearDecorations();
 
             let targetColumn: ViewColumn | undefined;
-            let existedBeforePreview = false;
             const uriStr = uri.toString();
 
             if (range) {
@@ -574,12 +595,10 @@ class FileBrowser {
 
                 if (editorInOriginal) {
                     targetColumn = editorInOriginal.viewColumn;
-                    existedBeforePreview = true;
                 } else {
                     const anyVisibleEditor = visibleEditors.find(e => e.document.uri.toString() === uriStr);
                     if (anyVisibleEditor) {
                         targetColumn = anyVisibleEditor.viewColumn;
-                        existedBeforePreview = true;
                     }
                 }
             }
@@ -590,7 +609,6 @@ class FileBrowser {
 
                 if (tabInActive) {
                     targetColumn = activeGroup.viewColumn;
-                    if (!tabInActive.isPreview) existedBeforePreview = true;
                 } else {
                     targetColumn = this.originalViewColumn || vscode.ViewColumn.Active;
                 }
@@ -936,7 +954,12 @@ class FileBrowser {
                     }
                 }
             } else {
-                const files = await vscode.workspace.findFiles('**/*', '{**/node_modules/**, **/.git/**, **/dist/**, **/build/**, **/*.map, **/*.min.js}', 250);
+                const excludeArray = config<string[]>(ConfigItem.SearchExcludePattern) || [];
+                let excludePattern: string | undefined = undefined;
+                if (excludeArray.length > 0) {
+                    excludePattern = `{${excludeArray.join(',')}}`;
+                }
+                const files = await vscode.workspace.findFiles('**/*', excludePattern, 250);
                 if (this.searchToken !== token) return;
                 const decoder = new TextDecoder('utf-8'); const batchSize = 10;
                 for (let i = 0; i < files.length; i += batchSize) {
