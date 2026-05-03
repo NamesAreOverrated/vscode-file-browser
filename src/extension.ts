@@ -1914,90 +1914,140 @@ class FileBrowser {
         const val = this.current.value;
         if (!val) return;
 
-        // ======== 更新：防止匹配新指令 ========
+        // 1. 识别并提取命令前缀 (如 r:, >t, #, ! 等)
         const cmdMatch = val.match(/^([rdcm]:|#|>t|>d|>r|!|@@|@|\$\$?|%%?|:)\s*/);
         const cmdPrefix = cmdMatch ? cmdMatch[0] : "";
         const argsStr = val.substring(cmdPrefix.length);
 
+        // 文本/诊断/行号搜索模式不进行 Tab 路径补全
         if (cmdPrefix.match(/^(\$\$?|%%?|:)\s*$/)) return;
 
         let textBeforeToken = "";
         let tokenToComplete = argsStr;
 
+        // 2. 针对接收多个参数的批量指令（r:, d:, c:, m:），正确切分当前正在输入的 Token
         if (cmdPrefix.match(/^[rdcm]:\s*$/)) {
-            const lastSpaceIdx = argsStr.lastIndexOf(' ');
-            if (lastSpaceIdx !== -1) {
-                textBeforeToken = argsStr.substring(0, lastSpaceIdx + 1);
-                tokenToComplete = argsStr.substring(lastSpaceIdx + 1);
+            let inSingleQuote = false;
+            let inDoubleQuote = false;
+            let lastUnquotedSpaceIdx = -1;
+
+            // 识别引号边界，仅在非引号内的空格处进行切分
+            for (let i = 0; i < argsStr.length; i++) {
+                const char = argsStr[i];
+                if (char === "'" && !inDoubleQuote) inSingleQuote = !inSingleQuote;
+                else if (char === '"' && !inSingleQuote) inDoubleQuote = !inDoubleQuote;
+                else if (char === ' ' && !inSingleQuote && !inDoubleQuote) {
+                    lastUnquotedSpaceIdx = i;
+                }
+            }
+
+            if (lastUnquotedSpaceIdx !== -1) {
+                textBeforeToken = argsStr.substring(0, lastUnquotedSpaceIdx + 1);
+                tokenToComplete = argsStr.substring(lastUnquotedSpaceIdx + 1);
             }
         }
 
-        if (!tokenToComplete) return;
+        // 3. 处理可能存在的前置引号（剥离它以便正确使用正则匹配文件名）
+        let leadingQuote = "";
+        if (tokenToComplete.startsWith('"') || tokenToComplete.startsWith("'")) {
+            leadingQuote = tokenToComplete[0];
+            tokenToComplete = tokenToComplete.substring(1);
+        }
 
+        if (!tokenToComplete && !leadingQuote) return;
+
+        // 4. 建立候选词库 (基于文件名的 Map 以去重并记录是否为文件夹)
+        const candidates = new Map<string, boolean>();
+
+        // 4.1 加入当前物理目录项（保障普通模式、单输入指令的基础补全）
+        for (const item of this.items) {
+            if (item.name) {
+                candidates.set(item.name, !!(item.fileType !== undefined && (item.fileType & vscode.FileType.Directory)));
+            }
+        }
+
+        // 4.2 加入当前 UI 列表中的项（保障各种深度 Search、跨目录 Suggestion、>t 命令的补全）
+        for (const item of this.current.items) {
+            if (!item.name) continue;
+            // 剔除功能性虚拟项
+            if (item.name.match(/^[>!#@%\$]/)) continue;
+            if (item.label.includes("Create Pattern:") || item.label.includes("Open / Create Path:") || item.label.includes("Create:")) continue;
+            if (item.action === Action.BulkCreate || item.action === Action.SingleCreate) continue;
+
+            const isDir = !!(item.fileType !== undefined && (item.fileType & vscode.FileType.Directory));
+            // 如果不存在，或者现有记录为 false 但当前为 true（文件夹优先保障）
+            if (!candidates.has(item.name) || isDir) {
+                candidates.set(item.name, isDir);
+            }
+        }
+
+        if (candidates.size === 0) return;
+
+        // 5. 将待补全的 token 拆分为通配符部分与字面量部分
+        // 例如 `src/*_s` => `src/*` (wildPrefix) 和 `_s` (literalSuffix)
         const wildcardIdx = Math.max(tokenToComplete.lastIndexOf('*'), tokenToComplete.lastIndexOf('?'));
         const wildPrefix = wildcardIdx !== -1 ? tokenToComplete.substring(0, wildcardIdx + 1) : "";
         const literalSuffix = wildcardIdx !== -1 ? tokenToComplete.substring(wildcardIdx + 1) : tokenToComplete;
 
         const escapeForRegex = (str: string) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-        const escapedWild = escapeForRegex(wildPrefix)
-            .replace(/\\\*/g, '.*')
-            .replace(/\\\?/g, '.');
-        const escapedLiteral = escapeForRegex(literalSuffix);
-
         let regex: RegExp;
         try {
-            regex = new RegExp(`^(${escapedWild})(${escapedLiteral}.*)$`, "i");
+            if (wildcardIdx !== -1) {
+                const patternBefore = escapeForRegex(wildPrefix).replace(/\\\*/g, '.*').replace(/\\\?/g, '.');
+                const patternLiteral = escapeForRegex(literalSuffix);
+                // 捕获前缀 + 我们真正想要提取的剩余后缀
+                regex = new RegExp(`^(${patternBefore}${patternLiteral})(.*)$`, "i");
+            } else {
+                const patternLiteral = escapeForRegex(literalSuffix);
+                regex = new RegExp(`^(${patternLiteral})(.*)$`, "i");
+            }
         } catch (e) {
             return;
         }
 
-        // ======== 更新：防止 tab 到新指令的虚拟项 ========
-        const validItems = this.current.items.filter(item =>
-            item.name &&
-            item.name !== ">t" &&
-            item.name !== ">d" &&
-            item.name !== ">r" &&
-            !item.label.includes("Create Pattern:") &&
-            !item.label.includes("Open / Create Path:")
-        );
-
-        if (validItems.length === 0) return;
-
+        // 6. 从候选库中过滤出匹配项，提取需要追加的后缀
         const matchedSuffixes: { full: string, suffix: string, isDir: boolean }[] = [];
 
-        for (const item of validItems) {
-            const match = item.name.match(regex);
+        for (const [name, isDir] of candidates.entries()) {
+            const match = name.match(regex);
             if (match) {
                 matchedSuffixes.push({
-                    full: item.name,
-                    suffix: match[2],
-                    isDir: !!(item.fileType !== undefined && (item.fileType & vscode.FileType.Directory))
+                    full: name,
+                    suffix: match[2], // Group 2 就是被前缀匹配掉后，剩下的部分
+                    isDir: isDir
                 });
             }
         }
 
         if (matchedSuffixes.length === 0) return;
 
+        // 7. 计算所有符合条件后缀的最长公共前缀 (LCP - Longest Common Prefix)
         let lcp = matchedSuffixes[0].suffix;
         for (let i = 1; i < matchedSuffixes.length; i++) {
             const curr = matchedSuffixes[i].suffix;
             let j = 0;
-            while (j < lcp.length && j < curr.length && lcp[j] === curr[j]) {
+            // 大小写不敏感地寻找公共前缀长度
+            while (j < lcp.length && j < curr.length && lcp[j].toLowerCase() === curr[j].toLowerCase()) {
                 j++;
             }
             lcp = lcp.substring(0, j);
             if (lcp === "") break;
         }
 
-        let newSuffix = lcp;
-        if (matchedSuffixes.length === 1 && matchedSuffixes[0].isDir && !newSuffix.endsWith('/')) {
+        // 8. 组装新 Token
+        // 沿用第一个匹配项的原始大小写（符合文件系统的真实命名规则）
+        let newSuffix = matchedSuffixes[0].suffix.substring(0, lcp.length);
+
+        // 如果最终唯一且完美补全到了一个文件夹，自动加上斜杠
+        if (matchedSuffixes.length === 1 && matchedSuffixes[0].isDir && !newSuffix.endsWith('/') && !tokenToComplete.endsWith('/')) {
             newSuffix += '/';
         }
 
-        const newToken = wildPrefix + newSuffix;
+        const newToken = leadingQuote + tokenToComplete + newSuffix;
         const newValue = cmdPrefix + textBeforeToken + newToken;
 
+        // 9. 生效更新
         if (this.current.value !== newValue) {
             this.current.value = newValue;
         }
